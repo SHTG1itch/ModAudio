@@ -5,7 +5,10 @@
       "Bash(python -c \":*)",
       "Bash(python main.py --list-devices)",
       "Bash(python3:*)",
-      "Bash(python main.py --help)"
+      "Bash(python main.py --help)",
+      "Bash(python -c \"import customtkinter; print\\(''customtkinter'', customtkinter.__version__\\)\")",
+      "Bash(taskkill /F /IM python.exe /FI \"WINDOWTITLE eq ModAudio*\")",
+      "Bash(tasklist)"
     ]
   }
 }
