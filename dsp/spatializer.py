@@ -249,4 +249,7 @@ def make_spatializer(preset):
     mode = preset.get("mode", "headphones")
     if mode == "speakers":
         return StereoWidenerProcessor(fs=48000, preset=preset)
+    if mode in ("surround", "surround_mono"):
+        from .surround_engine import make_virtual_surround
+        return make_virtual_surround(fs=48000, preset=preset)
     return BinauralSurroundProcessor(fs=48000, preset=preset)

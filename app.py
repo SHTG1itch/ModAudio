@@ -35,6 +35,7 @@ PRESETS = {
         "rt60": 1.3,  "rt60_hf": 0.65,
         "reverb_predelay_ms": 22.0,  "reverb_mix": 0.25,  "early_ref_mix": 0.45,
         "stereo_width": 2.0,  "surround_level": 0.72,  "lfe_level": 0.85,
+        "rear_level": 0.60,
         "bass_boost_db": 6.0,  "sub_bass_db": 4.5,
         "bass_harm_drive": 2.8,  "bass_harm_level": 0.50,
         "air_exciter_level": 0.18,
@@ -45,6 +46,7 @@ PRESETS = {
         "rt60": 1.7,  "rt60_hf": 0.75,
         "reverb_predelay_ms": 28.0,  "reverb_mix": 0.32,  "early_ref_mix": 0.55,
         "stereo_width": 2.3,  "surround_level": 0.85,  "lfe_level": 0.95,
+        "rear_level": 0.72,
         "bass_boost_db": 9.0,  "sub_bass_db": 6.0,
         "bass_harm_drive": 3.5,  "bass_harm_level": 0.65,
         "air_exciter_level": 0.22,
@@ -55,6 +57,7 @@ PRESETS = {
         "rt60": 1.0,  "rt60_hf": 0.55,
         "reverb_predelay_ms": 20.0,  "reverb_mix": 0.18,  "early_ref_mix": 0.38,
         "stereo_width": 1.8,  "surround_level": 0.65,  "lfe_level": 0.80,
+        "rear_level": 0.55,
         "bass_boost_db": 4.5,  "sub_bass_db": 3.5,
         "bass_harm_drive": 2.2,  "bass_harm_level": 0.38,
         "air_exciter_level": 0.14,
@@ -65,6 +68,7 @@ PRESETS = {
         "rt60": 0.8,  "rt60_hf": 0.45,
         "reverb_predelay_ms": 15.0,  "reverb_mix": 0.12,  "early_ref_mix": 0.28,
         "stereo_width": 1.5,  "surround_level": 0.55,  "lfe_level": 0.70,
+        "rear_level": 0.45,
         "bass_boost_db": 3.0,  "sub_bass_db": 2.5,
         "bass_harm_drive": 1.8,  "bass_harm_level": 0.28,
         "air_exciter_level": 0.10,
@@ -355,8 +359,8 @@ class ModAudioApp(ctk.CTk):
 
         self._mode_seg = ctk.CTkSegmentedButton(
             f,
-            values=["Headphones", "Speakers"],
-            font=ctk.CTkFont(size=13),
+            values=["Headphones", "Speakers", "Surround", "Mono"],
+            font=ctk.CTkFont(size=12),
             height=36,
             selected_color=C["accent"],
             selected_hover_color="#5a73f5",
@@ -365,6 +369,16 @@ class ModAudioApp(ctk.CTk):
         )
         self._mode_seg.set("Headphones")
         self._mode_seg.pack(fill="x")
+
+        # Mode description label
+        self._mode_desc = ctk.CTkLabel(
+            f,
+            text="Binaural 5.1 HRTF — optimised for headphones",
+            font=ctk.CTkFont(size=10),
+            text_color=C["dim"],
+            anchor="w",
+        )
+        self._mode_desc.pack(fill="x", padx=2, pady=(4, 0))
 
     # -- Devices -------------------------------------------------------------
 
@@ -656,8 +670,24 @@ class ModAudioApp(ctk.CTk):
             btn.configure(fg_color=C["accent"], text_color="white")
         self._schedule_rebuild()
 
+    # Mode label shown under the segmented button
+    _MODE_DESCS = {
+        "headphones":   "Binaural 5.1 HRTF — optimised for headphones",
+        "speakers":     "Stereo widening + Haas depth — for speaker playback",
+        "surround":     "Virtual 7.1 HRTF with elevation — headphones or speakers",
+        "surround_mono":"7.1 HRTF collapsed to mono — works with a single speaker",
+    }
+
     def _on_mode_change(self, value):
-        self._mode = "headphones" if value == "Headphones" else "speakers"
+        mapping = {
+            "Headphones": "headphones",
+            "Speakers":   "speakers",
+            "Surround":   "surround",
+            "Mono":       "surround_mono",
+        }
+        self._mode = mapping.get(value, "headphones")
+        if hasattr(self, "_mode_desc"):
+            self._mode_desc.configure(text=self._MODE_DESCS.get(self._mode, ""))
         self._schedule_rebuild()
 
     def _on_device_change(self, display_name, attr_menu):
@@ -674,10 +704,11 @@ class ModAudioApp(ctk.CTk):
 
     def _build_preset(self) -> dict:
         """Merge active preset + slider overrides + mode into a final preset dict."""
-        base = dict(HEADPHONES_PRESET if self._mode == "headphones"
-                    else SPEAKERS_PRESET)
+        # Surround modes use headphones base (detailed HRTF-oriented settings).
+        # Mono surround uses speakers base (physical playback oriented).
+        use_hp = self._mode in ("headphones", "surround")
+        base = dict(HEADPHONES_PRESET if use_hp else SPEAKERS_PRESET)
         base["mode"] = self._mode
-        # Speaker positions from base preset
         base.update(self._slider_vals)
         return base
 

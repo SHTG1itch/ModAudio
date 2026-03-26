@@ -28,6 +28,7 @@ HEADPHONES_PRESET = {
     "surround_level": 0.72,        # LS/RS channel level
     "center_level":   0.88,        # Center channel level
     "lfe_level":      0.85,        # Sub-bass LFE level
+    "rear_level":     0.60,        # LB/RB back-channel level (surround modes)
 
     # Virtual speaker azimuths (degrees, positive = right)
     "speaker_L_az":  -30.0,
@@ -81,6 +82,7 @@ SPEAKERS_PRESET = {
     "surround_level": 0.65,        # Haas-delay surround level
     "center_level":   0.90,
     "lfe_level":      0.90,        # More bass for speakers (typically better LF)
+    "rear_level":     0.50,        # LB/RB back-channel level (surround modes)
     "haas_delay_ms":  22.0,        # Haas delay for stereo depth
 
     # -- Cinema EQ ------------------------------------------------------------
