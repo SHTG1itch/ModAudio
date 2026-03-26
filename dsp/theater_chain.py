@@ -1,145 +1,157 @@
 """
 TheaterChain - master DSP pipeline.
 
-Signal flow:
+Signal flow (headphones mode):
 
   Stereo in (float32, (N, 2))
       |
       v
-  +- CinemaEqualizer --------------------------------------------------+
-  |  X-curve + sub-bass boost + presence                               |
-  +--------------------------------------------------------------------+
+  +- HarmonicBassEnhancer + AirBandExciter ----+
+  |  Psychoacoustic bass synthesis              |
+  |  Harmonic sparkle on high frequencies      |
+  +--------------------------------------------+
       |
       v
-  +- VirtualSurroundProcessor -----------------------------------------+
-  |  Band-split -> 5-channel upmix -> HRTF binaural render             |
-  |  (Sub-bass omnidirectional, mid surround, HF widened)              |
-  +--------------------------------------------------------------------+
+  +- CinemaEqualizer ---------------------------+
+  |  X-curve + sub-bass boost + presence       |
+  +--------------------------------------------+
       |
       v
-  +- TheaterReverb ----------------------------------------------------+
-  |  Early reflections + FDN reverb tail (RT60 ~ 1.2 s)               |
-  +--------------------------------------------------------------------+
+  +- BinauralSurroundProcessor -----------------+
+  |  Band-split -> 5ch upmix -> HRTF render    |
+  |  Brown-Duda head shadow + pinna filters    |
+  +--------------------------------------------+
       |
       v
-  +- Output limiter ---------------------------------------------------+
-  |  Peak limiter + master gain trim                                   |
-  +--------------------------------------------------------------------+
+  +- TheaterReverb -----------------------------+
+  |  Pre-delay (22ms) + Early reflections      |
+  |  + FDN reverb tail (RT60 ~1.3s)            |
+  +--------------------------------------------+
+      |
+      v
+  +- MultibandCompressor -----------------------+
+  |  4-band theater dynamics                   |
+  +--------------------------------------------+
+      |
+      v
+  +- TransientEnhancer -------------------------+
+  |  Attack/punch enhancement                  |
+  +--------------------------------------------+
+      |
+      v
+  +- Master gain + Peak limiter ----------------+
+  +--------------------------------------------+
       |
       v
   Stereo out (float32, (N, 2))
+
+Speaker mode replaces BinauralSurroundProcessor with StereoWidenerProcessor.
 """
 
 from __future__ import annotations
 import numpy as np
 
 from .equalizer  import CinemaEqualizer
-from .spatializer import VirtualSurroundProcessor
+from .spatializer import make_spatializer
 from .reverb      import TheaterReverb
-
-
-class _PeakLimiter:
-    """
-    Simple look-ahead peak limiter using a one-pole envelope follower.
-    Transparent on transients, prevents digital clipping.
-    """
-
-    def __init__(self, threshold: float = 0.93, release_ms: float = 80.0,
-                 fs: int = 48000):
-        self._threshold = threshold
-        self._release   = np.exp(-1.0 / (release_ms * 1e-3 * fs))
-        self._env       = 0.0
-
-    def process(self, x: np.ndarray) -> np.ndarray:
-        """x: (N, C) float32 -> (N, C) float32"""
-        x64 = x.astype(np.float64)
-        peak = np.abs(x64).max(axis=1)   # per-sample peak across channels
-        out  = np.empty_like(x64)
-        thr  = self._threshold
-        rel  = self._release
-        env  = self._env
-
-        for i in range(len(peak)):
-            # Attack: instant
-            env = max(peak[i], env * rel)
-            gain = thr / max(env, thr)
-            out[i] = x64[i] * gain
-
-        self._env = env
-        return out.astype(x.dtype)
-
-    def reset(self):
-        self._env = 0.0
+from .dynamics    import MultibandCompressor, TransientEnhancer, PeakLimiter
+from .enhancer    import HarmonicBassEnhancer, AirBandExciter
 
 
 class TheaterChain:
     """
-    Thread-safe, block-based theater audio processor.
+    Complete theater audio processor.
 
-    Usage
-    -----
-    chain = TheaterChain(fs=48000)
-    output_block = chain.process(input_block)   # input_block shape: (N, 2)
+    Parameters
+    ----------
+    fs     : int  - sample rate (default 48000)
+    preset : dict - theater preset (default HEADPHONES_PRESET)
     """
 
     def __init__(self, fs: int = 48000, preset: dict | None = None):
         if preset is None:
-            from config import THEATER_PRESET
-            preset = THEATER_PRESET
+            from config import HEADPHONES_PRESET
+            preset = HEADPHONES_PRESET
 
         self._fs     = fs
         self._preset = preset
 
-        # Output master gain (linear)
         self._master_gain = 10 ** (preset["output_gain_db"] / 20.0)
 
-        # DSP stages
-        self._eq        = CinemaEqualizer(fs=fs, num_channels=2, preset=preset)
-        self._surround  = VirtualSurroundProcessor(fs=fs, preset=preset)
-        self._reverb    = TheaterReverb(fs=fs, preset=preset)
-        self._limiter   = _PeakLimiter(
+        # -- Harmonic enhancement (pre-EQ) ------------------------------------
+        self._bass_enh = HarmonicBassEnhancer(
+            cutoff=120.0,
+            drive=preset["bass_harm_drive"],
+            level=preset["bass_harm_level"],
+            fs=fs,
+        )
+        self._air_exc = AirBandExciter(
+            cutoff=8000.0,
+            level=preset["air_exciter_level"],
+            fs=fs,
+        )
+
+        # -- Cinema EQ --------------------------------------------------------
+        self._eq = CinemaEqualizer(fs=fs, num_channels=2, preset=preset)
+
+        # -- Spatialization ---------------------------------------------------
+        self._surround = make_spatializer(preset)
+
+        # -- Room reverb ------------------------------------------------------
+        self._reverb = TheaterReverb(fs=fs, preset=preset)
+
+        # -- Dynamics ---------------------------------------------------------
+        self._comp = MultibandCompressor(
+            fs=fs,
+            drive=preset["mb_compress_drive"],
+        )
+        self._trans = TransientEnhancer(
+            fs=fs,
+            amount=preset["transient_amount"],
+        )
+
+        # -- Output -----------------------------------------------------------
+        self._limiter = PeakLimiter(
             threshold=preset["limiter_threshold"],
             release_ms=preset["limiter_release_ms"],
             fs=fs,
         )
 
-    # -- Public API ------------------------------------------------------------
+    # -------------------------------------------------------------------------
 
     def process(self, block: np.ndarray) -> np.ndarray:
         """
-        Process one audio block through the full theater DSP chain.
-
-        Parameters
-        ----------
-        block : ndarray, shape (N, 2), dtype float32
-            Stereo PCM samples in the range [-1, +1].
-
-        Returns
-        -------
-        ndarray, shape (N, 2), dtype float32
+        block : (N, 2) float32  stereo PCM in [-1, +1]
+        Returns (N, 2) float32
         """
         if block.ndim == 1:
             block = np.stack([block, block], axis=1)
         if block.shape[1] != 2:
-            raise ValueError(f"Expected stereo (2-channel) block, got shape {block.shape}")
+            raise ValueError(f"Expected stereo block, got shape {block.shape}")
 
         x = block.astype(np.float32, copy=False)
 
-        x = self._eq.process(x)          # Cinema X-curve EQ
-        x = self._surround.process(x)    # Virtual surround + binaural
-        x = self._reverb.process(x)      # Theater room acoustics
-        x = x * self._master_gain        # Master gain trim
-        x = self._limiter.process(x)     # Peak limiter
+        x = self._bass_enh.process(x)   # harmonic bass synthesis
+        x = self._air_exc.process(x)    # air-band exciter
+        x = self._eq.process(x)         # cinema X-curve EQ
+        x = self._surround.process(x)   # virtual surround / widening
+        x = self._reverb.process(x)     # theater room acoustics
+        x = self._comp.process(x)       # multi-band compression
+        x = self._trans.process(x)      # transient enhancement
+        x = x * self._master_gain       # master trim
+        x = self._limiter.process(x)    # peak limiter
 
         return x
 
     def reset(self):
-        """Reset all filter/delay states (call on stream restart)."""
-        self._eq.reset()
-        self._surround.reset()
-        self._reverb.reset()
-        self._limiter.reset()
+        for stage in (self._bass_enh, self._air_exc, self._eq, self._surround,
+                      self._reverb, self._comp, self._trans, self._limiter):
+            stage.reset()
 
     @property
     def fs(self) -> int:
         return self._fs
+
+    @property
+    def mode(self) -> str:
+        return self._preset.get("mode", "headphones")
