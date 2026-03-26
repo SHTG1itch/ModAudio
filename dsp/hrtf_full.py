@@ -204,7 +204,7 @@ class FullSphereHRTFRenderer:
         # Linear approximation: 8500 + elev_deg * 50 Hz.
         #   0° → 8500 Hz,  +30° → 10 000 Hz,  −30° → 7 000 Hz
         n1_hz = 8500.0 + float(np.clip(elevation_deg, -45.0, 65.0)) * 50.0
-        n1_hz = float(np.clip(n1_hz, 5500.0, 13 500.0))
+        n1_hz = float(np.clip(n1_hz, 5500.0, 13500.0))
         n1_hz = min(n1_hz, fs * 0.45)          # stay below Nyquist
         b_n1, a_n1 = _peaking_ba(n1_hz, -11.0, q=3.2, fs=fs)
 
