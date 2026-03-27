@@ -6,6 +6,9 @@ Run with:  python app.py
 """
 
 import sys, os, threading, time
+
+_IS_WIN = sys.platform == "win32"
+_IS_MAC = sys.platform == "darwin"
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -169,17 +172,17 @@ class ModAudioApp(ctk.CTk):
         self._hostapis = sd.query_hostapis()
         self._build_device_lists()
 
-        # Multi-speaker output device list — WASAPI only.
-        # WASAPI is required for low-latency multi-device streaming and for
-        # loopback capture (pyaudiowpatch).  MME/DS devices introduce large
-        # buffer mismatches and cannot be used reliably as second outputs.
+        # Multi-speaker output device list — prefer the native low-latency API
+        # for the current platform (WASAPI on Windows, Core Audio on macOS).
+        # MME/DS on Windows and non-preferred APIs introduce buffer mismatches.
+        _pref_api = self._preferred_api_label()
         self._all_out_list = []
         for i, d in enumerate(self._devs):
-            if d["max_output_channels"] >= 1 and self._hostapi_label(d["hostapi"]) == "WASAPI":
-                label = f"{d['name'][:48]}  [WASAPI]"
+            if d["max_output_channels"] >= 1 and self._hostapi_label(d["hostapi"]) == _pref_api:
+                label = f"{d['name'][:48]}  [{_pref_api}]"
                 self._all_out_list.append((i, label))
         if not self._all_out_list:
-            # Fallback: show all output devices with a warning tag
+            # Fallback: show all output devices
             for i, d in enumerate(self._devs):
                 if d["max_output_channels"] >= 1:
                     tag   = self._hostapi_label(d["hostapi"])
@@ -188,17 +191,17 @@ class ModAudioApp(ctk.CTk):
         if not self._all_out_list:
             self._all_out_list = [(0, "No output devices")]
 
-        # Multi-speaker capture input list — WASAPI only (for Full Control mode).
-        # Same reasoning: only WASAPI inputs work reliably alongside WASAPI outputs.
+        # Multi-speaker capture input list — preferred API + known loopback devices.
+        _loopback_kw = ("stereo mix", "what u hear", "wave out mix",
+                        "cable output", "vb-audio", "vb-cable", "loopback",
+                        "virtual audio driver", "modaudio surround",
+                        "blackhole", "soundflower")
         self._ms_all_in_list = []
         for i, d in enumerate(self._devs):
-            if d["max_input_channels"] >= 1 and self._hostapi_label(d["hostapi"]) == "WASAPI":
-                label = f"{d['name'][:48]}  [WASAPI]"
+            if d["max_input_channels"] >= 1 and self._hostapi_label(d["hostapi"]) == _pref_api:
+                label = f"{d['name'][:48]}  [{_pref_api}]"
                 self._ms_all_in_list.append((i, label))
         # Also include known loopback/virtual capture devices regardless of host API
-        _loopback_kw = ("stereo mix", "what u hear", "wave out mix",
-                        "cable output", "vb-audio", "loopback",
-                        "virtual audio driver", "modaudio surround")
         for i, d in enumerate(self._devs):
             if d["max_input_channels"] >= 1:
                 nl = d["name"].lower()
@@ -245,8 +248,10 @@ class ModAudioApp(ctk.CTk):
     # =======================================================================
 
     # Keywords that identify system-audio loopback / capture sources.
+    # Covers Windows (Stereo Mix, VB-Cable) and macOS (BlackHole, Soundflower, VB-Cable).
     _LOOPBACK_KW = ("stereo mix", "what u hear", "wave out mix",
-                    "loopback", "cable output", "vb-audio")
+                    "loopback", "cable output", "vb-audio",
+                    "blackhole", "soundflower", "vb-cable")
 
     def _dev_hostapi(self, device_idx: int) -> int:
         """Return the host-API index for a given device index."""
@@ -256,16 +261,31 @@ class ModAudioApp(ctk.CTk):
             return -1
 
     def _hostapi_label(self, ha_idx: int) -> str:
-        """Short host-API tag, e.g. 'WASAPI', 'MME', 'DS'."""
+        """Short host-API tag, e.g. 'WASAPI', 'MME', 'CoreAudio'."""
         try:
             name = self._hostapis[ha_idx]["name"]
-            if "WASAPI" in name:   return "WASAPI"
-            if "MME"   in name:   return "MME"
+            if "WASAPI" in name:      return "WASAPI"
+            if "MME"   in name:      return "MME"
             if "DirectSound" in name: return "DS"
-            if "WDM"   in name:   return "WDM"
+            if "WDM"   in name:      return "WDM"
+            if "Core Audio" in name:  return "CoreAudio"
+            if "ALSA"  in name:      return "ALSA"
+            if "PulseAudio" in name:  return "Pulse"
             return name[:8]
         except (IndexError, KeyError):
             return "?"
+
+    def _preferred_api_label(self) -> str:
+        """Return the best host-API label for the current platform."""
+        if _IS_WIN:
+            return "WASAPI"
+        if _IS_MAC:
+            return "CoreAudio"
+        # Linux: prefer PulseAudio, fall back to ALSA
+        for api in self._hostapis:
+            if "PulseAudio" in api.get("name", ""):
+                return "Pulse"
+        return "ALSA"
 
     def _build_device_lists(self):
         """
@@ -704,7 +724,9 @@ class ModAudioApp(ctk.CTk):
         ms = self._ms_frame
 
         # --- VIRTUAL DEVICE SETUP --------------------------------------------
-        self._build_section("MODAUDIO SURROUND SPEAKER", pad, parent=ms)
+        _vdev_section_title = ("MODAUDIO SURROUND SPEAKER" if _IS_WIN
+                               else "AUDIO CAPTURE SETUP")
+        self._build_section(_vdev_section_title, pad, parent=ms)
         f_vs = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=10)
         f_vs.pack(fill="x", padx=pad, pady=(0, 4))
         f_vs.grid_columnconfigure(1, weight=1)
@@ -723,13 +745,22 @@ class ModAudioApp(ctk.CTk):
                                       pady=(12, 4), sticky="ew")
 
         # Hint / instructions
-        self._ms_vdev_hint = ctk.CTkLabel(
-            f_vs,
-            text=(
+        if _IS_WIN:
+            _initial_hint = (
                 "Install the free ModAudio Surround virtual speaker so Windows\n"
                 "can route all audio through ModAudio.  One-time setup, no reboot.\n"
                 "The driver is MIT-licensed and production-signed (no test mode)."
-            ),
+            )
+        else:
+            _initial_hint = (
+                "Install a virtual loopback device to capture system audio:\n"
+                "  • VB-Cable for Mac   vb-audio.com/Cable/\n"
+                "  • BlackHole (free)   github.com/ExistentialAudio/BlackHole\n"
+                "Set it as your system audio output, then select it as Capture below."
+            )
+        self._ms_vdev_hint = ctk.CTkLabel(
+            f_vs,
+            text=_initial_hint,
             font=ctk.CTkFont(size=10),
             text_color=C["dim"],
             anchor="w", justify="left", wraplength=460,
@@ -761,7 +792,7 @@ class ModAudioApp(ctk.CTk):
                     sticky="ew")
         f_vbtn.grid_columnconfigure((0, 1, 2), weight=1)
 
-        # Primary: Install virtual driver
+        # Primary: Install virtual driver (Windows only)
         self._ms_btn_install_driver = ctk.CTkButton(
             f_vbtn, text="Install Virtual Speaker",
             font=ctk.CTkFont(size=11, weight="bold"),
@@ -771,7 +802,7 @@ class ModAudioApp(ctk.CTk):
         )
         self._ms_btn_install_driver.grid(row=0, column=0, padx=(0, 4), sticky="ew")
 
-        # Set as Windows default output
+        # Set as Windows default output (Windows only)
         self._ms_btn_set_default = ctk.CTkButton(
             f_vbtn, text="Set as Default",
             font=ctk.CTkFont(size=11),
@@ -783,7 +814,7 @@ class ModAudioApp(ctk.CTk):
         )
         self._ms_btn_set_default.grid(row=0, column=1, padx=4, sticky="ew")
 
-        # Open Windows Sound Settings
+        # Open system audio settings (cross-platform)
         self._ms_btn_sound_settings = ctk.CTkButton(
             f_vbtn, text="Sound Settings",
             font=ctk.CTkFont(size=11),
@@ -793,6 +824,12 @@ class ModAudioApp(ctk.CTk):
             command=self._on_ms_open_sound_settings,
         )
         self._ms_btn_sound_settings.grid(row=0, column=2, padx=(4, 0), sticky="ew")
+
+        # On non-Windows: hide the Windows-specific buttons and expand Sound Settings
+        if not _IS_WIN:
+            self._ms_btn_install_driver.grid_remove()
+            self._ms_btn_set_default.grid_remove()
+            self._ms_btn_sound_settings.grid_configure(column=0, columnspan=3, padx=0)
 
         # Full-width: Auto-configure Full Control mode
         self._ms_btn_autoconfigure = ctk.CTkButton(
@@ -918,9 +955,14 @@ class ModAudioApp(ctk.CTk):
                                     pady=8, sticky="ew")
 
         # Dual-speaker note (shown only in dual mode)
+        _dual_note_txt = (
+            "Set system default output to VB-Cable Input (or use 'Set as Default' above)."
+            if _IS_WIN else
+            "Set system audio output to your VB-Cable / BlackHole loopback device."
+        )
         self._ms_dual_note = ctk.CTkLabel(
             f_dev,
-            text="Set Windows default output to VB-Cable Input (or use 'Set as Windows Default' above).",
+            text=_dual_note_txt,
             font=ctk.CTkFont(size=10),
             text_color=C["warn"],
             anchor="w", wraplength=420,
@@ -1183,7 +1225,7 @@ class ModAudioApp(ctk.CTk):
         f_route.grid_columnconfigure(1, weight=1)
 
         for r, (side, desc, lbl_attr) in enumerate([
-            ("Front speaker:", "Windows default output (unprocessed)", "_ms_lbl_front_route"),
+            ("Front speaker:", "System audio output (unprocessed)", "_ms_lbl_front_route"),
             ("Rear speaker:",  "Surround L/R + Rear L/R + sub-bass",  "_ms_lbl_rear_route"),
         ]):
             py = (8 if r == 0 else 4, 8 if r == 1 else 4)
@@ -1339,7 +1381,7 @@ class ModAudioApp(ctk.CTk):
                         f"rear arrives {d:.0f} ms later.  Adjust delay slider to compensate.")
             elif front_bt and not rear_bt:
                 comp = (f"Rear (wired) will be delayed {d:.0f} ms to match "
-                        "the BT front speaker driven by Windows.")
+                        "the BT front speaker.")
             else:
                 comp = "No Bluetooth compensation needed."
         else:
@@ -1359,7 +1401,11 @@ class ModAudioApp(ctk.CTk):
     # =======================================================================
 
     def _ms_refresh_vdev_status(self):
-        """Query virtual driver status and update the setup panel."""
+        """Query virtual driver / loopback status and update the setup panel."""
+        if not _IS_WIN:
+            self._ms_refresh_vdev_status_nwin()
+            return
+
         if not _HAS_VDEV:
             self._ms_vdev_status_lbl.configure(
                 text="Ready — use Loopback mode (no setup needed)",
@@ -1453,6 +1499,69 @@ class ModAudioApp(ctk.CTk):
 
         _th.Thread(target=_worker, daemon=True).start()
 
+    def _ms_refresh_vdev_status_nwin(self):
+        """Update the setup panel on macOS / Linux (no Windows driver available)."""
+        _loopback_kw = ("blackhole", "soundflower", "vb-cable",
+                        "cable output", "vb-audio", "loopback")
+        found_name = None
+        found_idx  = None
+        for i, d in enumerate(sd.query_devices()):
+            if d["max_input_channels"] < 1:
+                continue
+            nl = d["name"].lower()
+            if any(kw in nl for kw in _loopback_kw):
+                found_name = d["name"]
+                found_idx  = i
+                break
+
+        if found_name is not None:
+            self._ms_vdev_status_lbl.configure(
+                text=f"Loopback device found: {found_name}",
+                text_color=C["success"],
+            )
+            self._ms_vdev_hint.configure(
+                text=(
+                    f"'{found_name}' is available as a capture source.\n"
+                    "In Full Control mode, select it as the Capture device.\n"
+                    "Set it as your system audio output to route all audio through ModAudio."
+                ),
+                text_color=C["dim"],
+            )
+            # Build a synthetic status cache so _on_ms_autoconfigure works
+            self._ms_vdev_status_cache = {
+                "driver_installed": False,
+                "best_capture": {
+                    "found":       True,
+                    "idx":         found_idx,
+                    "name":        found_name,
+                    "source_type": "loopback",
+                    "output_idx":  None,
+                    "output_name": None,
+                },
+            }
+            self._ms_btn_autoconfigure.grid()
+            # Ensure device appears in capture dropdown
+            self._ms_ensure_capture_device(found_idx, found_name)
+        else:
+            if _IS_MAC:
+                hint = (
+                    "No loopback device found.  Install one to capture system audio:\n"
+                    "  • VB-Cable for Mac   (vb-audio.com/Cable/)\n"
+                    "  • BlackHole (free)   (github.com/ExistentialAudio/BlackHole)\n"
+                    "Set it as your system audio output, then relaunch ModAudio."
+                )
+            else:
+                hint = (
+                    "No loopback device found.  Install a virtual audio device\n"
+                    "such as VB-Cable to capture system audio for processing."
+                )
+            self._ms_vdev_status_lbl.configure(
+                text="No loopback device found",
+                text_color=C["warn"],
+            )
+            self._ms_vdev_hint.configure(text=hint, text_color=C["dim"])
+            self._ms_btn_autoconfigure.grid_remove()
+
     def _ms_ensure_capture_device(self, dev_idx: int, dev_name: str):
         """Add a capture device to the capture dropdown if not already present."""
         if any(i == dev_idx for i, _ in self._ms_all_in_list):
@@ -1536,15 +1645,20 @@ class ModAudioApp(ctk.CTk):
         _th.Thread(target=_worker, daemon=True).start()
 
     def _rebuild_ms_device_lists(self):
-        """Refresh the WASAPI device lists after a new driver is installed."""
+        """Refresh the multi-speaker device lists after a new device appears."""
         try:
-            self._devs = list(sd.query_devices())
+            self._devs  = list(sd.query_devices())
+            _pref_api   = self._preferred_api_label()
+            _loopback_kw = ("stereo mix", "what u hear", "wave out mix",
+                            "cable output", "vb-audio", "vb-cable", "loopback",
+                            "virtual audio driver", "modaudio surround",
+                            "blackhole", "soundflower")
             # Rebuild output list
             new_out = []
             for i, d in enumerate(self._devs):
                 if (d["max_output_channels"] >= 1
-                        and self._hostapi_label(d["hostapi"]) == "WASAPI"):
-                    label = f"{d['name'][:48]}  [WASAPI]"
+                        and self._hostapi_label(d["hostapi"]) == _pref_api):
+                    label = f"{d['name'][:48]}  [{_pref_api}]"
                     new_out.append((i, label))
             if new_out:
                 self._all_out_list = new_out
@@ -1552,12 +1666,9 @@ class ModAudioApp(ctk.CTk):
             new_in = []
             for i, d in enumerate(self._devs):
                 if (d["max_input_channels"] >= 1
-                        and self._hostapi_label(d["hostapi"]) == "WASAPI"):
-                    label = f"{d['name'][:48]}  [WASAPI]"
+                        and self._hostapi_label(d["hostapi"]) == _pref_api):
+                    label = f"{d['name'][:48]}  [{_pref_api}]"
                     new_in.append((i, label))
-            _loopback_kw = ("stereo mix", "what u hear", "wave out mix",
-                            "cable output", "vb-audio", "loopback",
-                            "virtual audio driver", "modaudio surround")
             for i, d in enumerate(self._devs):
                 if d["max_input_channels"] >= 1:
                     nl = d["name"].lower()
@@ -1580,9 +1691,21 @@ class ModAudioApp(ctk.CTk):
             print(f"[rebuild_ms_lists] {exc}")
 
     def _on_ms_open_sound_settings(self):
-        """Open Windows Sound Settings."""
+        """Open the system audio settings panel (cross-platform)."""
         if _HAS_VDEV:
             _vdev.open_sound_settings()
+        elif _IS_MAC:
+            import subprocess as _sp
+            try:
+                _sp.Popen(["open", "/System/Library/PreferencePanes/Sound.prefPane"])
+            except Exception:
+                pass
+        else:
+            import subprocess as _sp
+            try:
+                _sp.Popen(["pavucontrol"])
+            except Exception:
+                pass
 
     def _on_ms_set_default_device(self):
         """Set the ModAudio Surround / virtual driver as Windows default output."""
@@ -1666,7 +1789,8 @@ class ModAudioApp(ctk.CTk):
         src_desc = {
             "virtual_driver": "ModAudio Surround virtual speaker",
             "stereo_mix":     "Stereo Mix (system loopback)",
-        }.get(src, src)
+            "loopback":       cap.get("name") or "loopback device",
+        }.get(src, src or "loopback device")
 
         self._ms_vdev_hint.configure(
             text=(
@@ -1860,18 +1984,32 @@ class ModAudioApp(ctk.CTk):
         if attr_menu == "_in_dev_menu":
             self._refresh_out_menu()
 
-    _MS_MODE_DESCS = {
-        "loopback": (
-            "Captures what your front speaker is already playing via WASAPI loopback.\n"
-            "No extra software needed — works on any Windows PC.\n"
-            "Front speaker plays normally; rear speaker adds surround + direct blend."
-        ),
-        "dual": (
-            "Full theater DSP applied to BOTH speakers simultaneously.\n"
-            "Requires a virtual capture device (VB-Cable recommended, Stereo Mix works).\n"
-            "Use 'Auto-Configure Full Control' above to set up automatically."
-        ),
-    }
+    if _IS_WIN:
+        _MS_MODE_DESCS = {
+            "loopback": (
+                "Captures what your front speaker is already playing via WASAPI loopback.\n"
+                "No extra software needed — works on any Windows PC.\n"
+                "Front speaker plays normally; rear speaker adds surround + direct blend."
+            ),
+            "dual": (
+                "Full theater DSP applied to BOTH speakers simultaneously.\n"
+                "Requires a virtual capture device (VB-Cable recommended, Stereo Mix works).\n"
+                "Use 'Auto-Configure Full Control' above to set up automatically."
+            ),
+        }
+    else:
+        _MS_MODE_DESCS = {
+            "loopback": (
+                "Captures audio from a virtual loopback device (VB-Cable or BlackHole).\n"
+                "Set the loopback device as your system audio output first.\n"
+                "Front speaker plays normally; rear speaker adds surround + direct blend."
+            ),
+            "dual": (
+                "Full theater DSP applied to BOTH speakers simultaneously.\n"
+                "Requires a virtual capture device (VB-Cable or BlackHole).\n"
+                "Use 'Auto-Configure Full Control' above to set up automatically."
+            ),
+        }
 
     def _on_ms_mode_change(self, value: str):
         self._ms_mode = "dual" if value == "Full Control" else "loopback"
@@ -1889,7 +2027,7 @@ class ModAudioApp(ctk.CTk):
             self._ms_dual_note.grid_remove()
             if hasattr(self, "_ms_lbl_front_route"):
                 self._ms_lbl_front_route.configure(
-                    text="Windows audio (plays normally, loopback captured)")
+                    text="System audio (plays normally, loopback captured)")
             if hasattr(self, "_ms_lbl_rear_route"):
                 self._ms_lbl_rear_route.configure(
                     text="Surround L/R + Rear L/R + sub-bass")

@@ -725,8 +725,15 @@ def get_status() -> dict:
 # ---------------------------------------------------------------------------
 
 def open_sound_settings() -> None:
-    """Open Windows Sound Settings (Playback devices panel)."""
+    """Open the system audio settings panel (cross-platform)."""
     import subprocess as _sp
+    if sys.platform == "darwin":
+        try:
+            _sp.Popen(["open", "/System/Library/PreferencePanes/Sound.prefPane"])
+        except Exception:
+            pass
+        return
+    # Windows
     try:
         _sp.Popen("start ms-settings:sound", shell=True)
     except Exception:

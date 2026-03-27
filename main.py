@@ -120,7 +120,12 @@ def main():
 
     if in_dev is None:
         print("\n  ERROR: No suitable input device found.")
-        print("  Install VB-Cable or enable Stereo Mix, then re-run.")
+        if sys.platform == "win32":
+            print("  Install VB-Cable or enable Stereo Mix, then re-run.")
+        elif sys.platform == "darwin":
+            print("  Install VB-Cable for Mac or BlackHole, then re-run.")
+        else:
+            print("  Install a virtual loopback device (e.g. VB-Cable), then re-run.")
         print("  Use --list-devices to see all available devices.\n")
         sys.exit(1)
 

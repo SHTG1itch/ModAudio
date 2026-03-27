@@ -127,9 +127,18 @@ def _get_loopback_device_info(pa: "_pyaw.PyAudio", front_dev_idx: int) -> dict |
 
 
 def _find_stereo_mix_device() -> int | None:
-    """Return the sounddevice index of a Stereo Mix / loopback input, or None."""
-    kw = ("stereo mix", "what u hear", "wave out mix", "loopback",
-          "cable output", "vb-audio")
+    """Return the sounddevice index of any system-loopback input, or None.
+
+    Searches for both Windows (Stereo Mix, VB-Cable) and macOS
+    (BlackHole, Soundflower, VB-Cable for Mac) virtual loopback devices.
+    """
+    kw = (
+        "stereo mix", "what u hear", "wave out mix",  # Windows system capture
+        "loopback",                                    # generic
+        "cable output", "vb-audio", "vb-cable",       # VB-Cable (Windows & macOS)
+        "blackhole",                                   # BlackHole (macOS)
+        "soundflower",                                 # Soundflower (macOS, legacy)
+    )
     for i, d in enumerate(sd.query_devices()):
         if d["max_input_channels"] < 1:
             continue
@@ -762,11 +771,17 @@ class MultiDeviceStream:
                     raise RuntimeError(
                         "Could not start loopback capture.\n\n"
                         f"pyaudiowpatch: {pyaw_err}\n"
-                        "Stereo Mix: not found on this system.\n\n"
+                        "Loopback device: not found on this system.\n\n"
                         "Solutions:\n"
-                        "  1. pip install pyaudiowpatch   (recommended, free)\n"
-                        "  2. Enable Stereo Mix in Windows Sound > Recording tab\n"
-                        "  3. Switch to Full Control mode (requires VB-Cable)")
+                        "  Windows:\n"
+                        "    1. pip install pyaudiowpatch  (recommended)\n"
+                        "    2. Enable Stereo Mix in Sound > Recording tab\n"
+                        "  macOS:\n"
+                        "    1. Install VB-Cable for Mac or BlackHole\n"
+                        "    2. Set it as the system audio output\n"
+                        "  All platforms:\n"
+                        "    Switch to Full Control mode and select the\n"
+                        "    loopback device as the Capture source.")
 
             self._rear_sd = sd.OutputStream(
                 samplerate=self._fs,

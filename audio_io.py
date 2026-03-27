@@ -1,21 +1,23 @@
 """
-Real-time audio I/O using sounddevice (PortAudio / WASAPI on Windows).
+Real-time audio I/O using sounddevice (PortAudio backend).
 
-How audio routing works on Windows:
-------------------------------------
+How audio routing works
+-----------------------
 Option A - VB-Cable (recommended, zero latency overhead):
-  1. Install VB-Audio Virtual Cable (free): https://vb-audio.com/Cable/
-  2. Set "CABLE Input" as your Windows default playback device.
-  3. Launch ModAudio: it reads from "CABLE Output" and writes to your
-     real speakers/headphones.
+  Windows: Install VB-Audio Virtual Cable, set "CABLE Input" as default
+           playback, and ModAudio reads from "CABLE Output".
+  macOS:   Install VB-Audio Cable for Mac; same principle applies.
 
-Option B - Stereo Mix / WASAPI Loopback (no extra software):
-  1. Enable "Stereo Mix" in Windows Sound settings (Control Panel ->
-     Sound -> Recording tab -> right-click -> Show Disabled Devices).
-  2. Launch ModAudio: select Stereo Mix as input, your speakers as output.
+Option B - BlackHole (macOS, free alternative to VB-Cable):
+  Install BlackHole (https://github.com/ExistentialAudio/BlackHole),
+  set it as the system output, and select it as the ModAudio capture.
 
-Both options are auto-detected by this module.  Run with --list-devices to
-see all available devices and their indices.
+Option C - Stereo Mix / WASAPI Loopback (Windows only, no extra software):
+  Enable "Stereo Mix" in Windows Sound settings (Control Panel ->
+  Sound -> Recording tab -> right-click -> Show Disabled Devices).
+
+All loopback sources are auto-detected by this module.  Run with
+--list-devices to see all available devices and their indices.
 """
 
 from __future__ import annotations
@@ -35,11 +37,12 @@ def list_devices() -> None:
     print("  " + "-" * 60)
     for i, d in enumerate(devices):
         marker = ""
-        name_lower = d["name"].lower()
-        if "cable output" in name_lower or "stereo mix" in name_lower:
-            marker = " <- good input"
-        elif "cable input" in name_lower:
-            marker = " <- set as Windows default out"
+        nl = d["name"].lower()
+        if any(kw in nl for kw in ("cable output", "stereo mix",
+                                    "blackhole", "soundflower")):
+            marker = " <- good input (loopback)"
+        elif "cable input" in nl:
+            marker = " <- set as system default output"
         print(f"  {i:3d}  {d['max_input_channels']:5d}  {d['max_output_channels']:6d}  "
               f"{d['name']}{marker}")
     print()
@@ -50,27 +53,42 @@ def find_default_devices() -> tuple[int | None, int | None]:
     Auto-detect the best input/output device pair.
 
     Priority for input:
-      1. VB-Cable Output
-      2. Stereo Mix
-      3. WASAPI loopback devices (contain "loopback")
-      4. System default input
+      1. VB-Cable Output   (Windows: "CABLE Output")
+      2. BlackHole         (macOS virtual loopback)
+      3. Soundflower       (macOS, legacy)
+      4. VB-Cable          (macOS variant — no "output" suffix)
+      5. Stereo Mix / What U Hear  (Windows)
+      6. Any device with "loopback" in the name
+      7. System default input
     """
     devices = sd.query_devices()
     input_id  = None
     output_id = None
 
-    # Find best input
+    # High-priority loopback sources (first match wins)
+    _high = ("cable output", "blackhole", "soundflower", "vb-cable")
+    # Medium-priority (Windows system capture)
+    _med  = ("stereo mix", "what u hear", "wave out mix")
+    # Low-priority fallback
+    _low  = ("loopback",)
+
     for i, d in enumerate(devices):
         if d["max_input_channels"] < 1:
             continue
         nl = d["name"].lower()
-        if "cable output" in nl:
+        if any(kw in nl for kw in _high):
             input_id = i
             break
-        if "stereo mix" in nl and input_id is None:
-            input_id = i
-        if "loopback" in nl and input_id is None:
-            input_id = i
+
+    if input_id is None:
+        for i, d in enumerate(devices):
+            if d["max_input_channels"] < 1:
+                continue
+            nl = d["name"].lower()
+            if any(kw in nl for kw in _med) and input_id is None:
+                input_id = i
+            if any(kw in nl for kw in _low) and input_id is None:
+                input_id = i
 
     # Default input if nothing found
     if input_id is None:

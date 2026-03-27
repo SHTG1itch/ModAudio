@@ -48,9 +48,22 @@ Transform your audio playback into an immersive theater experience with **ModAud
 - **Python 3.8+** (we recommend 3.11 or later)
 - **~200 MB** disk space for dependencies
 - **Audio device** (headphones, speakers, or USB audio interface)
+- **Windows audio API** — WASAPI (Windows Audio Session API) for low-latency audio I/O
+
+### macOS 10.13+ (Intel or Apple Silicon)
+- **Python 3.8+** (we recommend 3.11 or later)
+- **~200 MB** disk space for dependencies
+- **Audio device** (headphones, speakers, or USB audio interface)
+- **Core Audio** — macOS native audio framework (built-in)
+
+### Linux (Ubuntu 20.04+, Debian, Fedora)
+- **Python 3.8+** (we recommend 3.11 or later)
+- **~200 MB** disk space for dependencies
+- **Audio device** (headphones, speakers, or USB audio interface)
+- **PulseAudio** or **ALSA** — Linux audio server (usually pre-installed)
 
 ### Optional: Multi-Speaker Support
-- **VB-Cable** (see setup instructions below)
+- **Virtual audio loopback device** (platform-dependent; see "Virtual Audio Solutions" below)
 - Two physical speakers positioned in your listening environment
 - Audio interface or multi-channel capable soundcard (optional, for separate speaker routing)
 
@@ -69,20 +82,41 @@ cd ModAudio
 pip install -r requirements.txt
 ```
 
-**Required packages:**
+**Required packages (all platforms):**
 - `numpy` — numerical computation
 - `scipy` — signal processing (filters, FFT)
-- `sounddevice` — audio I/O
-- `customtkinter` — modern GUI framework
-- `pyaudiowpatch` — loopback audio capture (Windows only)
-- `comtypes` — COM interface for audio device control (Windows only)
+- `sounddevice` — cross-platform audio I/O (wraps WASAPI/Core Audio/ALSA)
+- `customtkinter` — modern cross-platform GUI framework
+
+**Windows-only packages:**
+- `pyaudiowpatch` — WASAPI loopback audio capture
+- `comtypes` — COM interface for audio device control
+
+**All packages gracefully handle platform-specific imports.** If you're on macOS or Linux, the Windows-specific packages are safely skipped.
 
 ### Step 3: Run the Application
+
+**GUI Mode (Recommended):**
 ```bash
 python app.py
 ```
+The ModAudio interactive GUI window will open. All features (single-speaker, multi-speaker, presets, real-time controls) are available.
 
-The ModAudio GUI window will open. You're ready to use single-speaker mode immediately.
+**CLI Mode (Headless/Streaming):**
+```bash
+python main.py                      # Auto-detect devices, headphones mode
+python main.py --mode speakers      # Stereo speaker mode
+python main.py --list-devices       # Show all available audio devices
+python main.py -i 22 -o 15          # Use specific input/output device indices
+python main.py --rt60 1.5 --gain -3 # Custom parameters (RT60, gain, etc.)
+```
+CLI mode is useful for:
+- Running on headless systems (servers, single-board computers)
+- Streaming scenarios where you don't need GUI controls
+- Automation and scripting
+- Integration with other audio pipelines
+
+See **CLI Reference** section below for all available options.
 
 ---
 
@@ -119,6 +153,64 @@ For **stereo speakers**, you'll hear:
 
 ---
 
+## Virtual Audio Solutions for Multi-Speaker Mode
+
+To route audio through two independent speakers, you need a **virtual audio loopback device**. This software-based "virtual cable" allows one speaker to play the standard audio while the other plays a modified surround signal.
+
+### Windows: VB-Cable (Recommended)
+
+**VB-Cable A & B** is the gold standard for Windows:
+- **Download:** https://vb-audio.com/Cable/
+- **Cost:** Free (donations requested)
+- **Features:** Low latency (~1 ms), multiple virtual cables available (Cable A, Cable B, etc.)
+- **Setup:** Run installer as admin, restart, device appears in Sound settings
+
+**Alternative: Stereo Mix (Built-in, No Installation)**
+- Already on your system (if enabled)
+- Enable in Settings → Sound → Volume mixer → App volume and device preferences
+- Limitations: Slightly higher latency, consumes one audio format slot
+
+### macOS: VB-Cable for Mac or BlackHole
+
+**VB-Cable for Mac** (Recommended)
+- **Download:** https://vb-audio.com/Cable/
+- **Cost:** Free (donations requested)
+- **Features:** Identical to Windows version, seamless integration with Core Audio
+- **Setup:** Install and restart; device appears in System Preferences
+
+**BlackHole** (Open-source Alternative)
+- **Download:** https://github.com/ExistentialAudio/BlackHole
+- **Cost:** Free and open-source
+- **Features:** Modern design, virtual audio routing ecosystem
+- **Setup:** Install and restart; appears in System Preferences
+
+**Soundflower** (Legacy)
+- Older virtual audio device; still works but less maintained
+- Not recommended for new setups; prefer VB-Cable or BlackHole
+
+### Linux: VB-Cable or Native PulseAudio Routing
+
+**VB-Cable for Linux**
+- **Download:** https://vb-audio.com/Cable/
+- **Cost:** Free (donations requested)
+- **Features:** Works with PulseAudio and ALSA backends
+- **Setup:** Install via package manager or source
+
+**Native PulseAudio Loopback** (Built-in)
+- Linux systems typically have PulseAudio with built-in loopback modules
+- ModAudio can auto-detect and use `module-loopback`
+- No additional software required; zero latency
+
+### Which Should I Use?
+
+| Platform | Recommended | Alternative | Notes |
+|---|---|---|---|
+| **Windows** | VB-Cable | Stereo Mix | VB-Cable is more reliable and has lower latency |
+| **macOS** | VB-Cable for Mac | BlackHole | Both work equally well; BlackHole is open-source |
+| **Linux** | Native PulseAudio | VB-Cable | PulseAudio loopback is zero-config and free |
+
+---
+
 ## Multi-Speaker Mode Setup
 
 ### Prerequisites
@@ -141,7 +233,7 @@ For **stereo speakers**, you'll hear:
 - ModAudio auto-routes: front plays clean audio, rear gets surround-enhanced signal
 
 **Option B: Full Control (Best Fidelity)**
-- Both speakers: routed through a **2-channel USB audio interface** or **multichannel soundcard**
+- Both speakers: routed through a **2-channel USB audio interface** or **multichannel soundcard**. However, if you have VB-Cable, you can bypass this entirely. Hence, we recommend VB-Cable as the primary service provider for full control.
 - Requires administrator privileges to install the virtual audio driver
 - ModAudio manages both speaker outputs independently, each with full DSP processing
 
@@ -313,36 +405,334 @@ Requires manual device selection in ModAudio's Device dropdown.
 
 ---
 
+## Audio APIs Explained
+
+ModAudio uses **platform-native audio APIs** to provide low-latency, high-quality audio I/O. Understanding which API your system uses can help with troubleshooting and optimization.
+
+### WASAPI (Windows Audio Session API)
+
+**Platform:** Windows 10/11 only
+**Used by:** ModAudio's `sounddevice` library via PortAudio backend
+
+WASAPI is Microsoft's modern audio API that provides:
+- **Low-latency I/O** — ~10–20 ms roundtrip on properly configured systems
+- **Hardware mixing** — Windows kernel-mode audio engine (KMixer)
+- **Exclusive mode** (optional) — Direct hardware access for professional audio applications
+- **Device routing** — Full control over playback and recording devices
+
+ModAudio uses WASAPI in **shared mode** (default, compatible with all apps) rather than exclusive mode (better latency but blocks other audio).
+
+**When you see "WASAPI" in ModAudio:**
+- The device is a Windows audio output
+- Audio is routed through the Windows audio session manager
+- Multiple apps can play through the same device simultaneously
+
+### Core Audio (macOS)
+
+**Platform:** macOS 10.13+ (Intel and Apple Silicon)
+**Used by:** ModAudio's `sounddevice` library via PortAudio backend
+
+Core Audio is Apple's native audio framework:
+- **Ultra-low latency** — ~5–10 ms on modern Macs (Apple Silicon even lower)
+- **Hardware abstraction** — Universal driver interface (HAL)
+- **Professional tools** — Used by Logic Pro, Final Cut Pro, etc.
+- **Sample-accurate timing** — Precise synchronization for multi-speaker setups
+
+Core Audio handles both **input** (audio capture) and **output** (playback) seamlessly, making it ideal for ModAudio's multi-speaker routing.
+
+**When you see "Core Audio" in ModAudio:**
+- The device is a macOS audio input or output
+- Audio is routed through Apple's Audio HAL
+- Professional latency performance is guaranteed
+
+### ALSA & PulseAudio (Linux)
+
+**Platform:** Linux (Ubuntu, Debian, Fedora, etc.)
+**Used by:** ModAudio's `sounddevice` library (configurable backend)
+
+Linux has two main audio systems:
+
+**ALSA (Advanced Linux Sound Architecture)**
+- **Kernel-level audio driver interface**
+- Direct hardware access, very low latency (~2–5 ms possible)
+- Used for professional/gaming audio
+- Requires understanding of ALSA device naming conventions
+
+**PulseAudio (Audio Daemon)**
+- **User-level audio server** running on top of ALSA
+- Simplified device management, automatic mixing
+- Standard on most modern Linux distributions
+- Slightly higher latency (~10–20 ms) but much more flexible
+
+ModAudio typically auto-detects and uses **PulseAudio** on modern Linux systems (easier setup), but can fall back to **ALSA** if PulseAudio isn't available.
+
+**When you see "PulseAudio" or "ALSA" in ModAudio:**
+- PulseAudio = user-friendly, automatic device routing
+- ALSA = direct kernel driver, lower latency if properly configured
+
+### Host API Detection
+
+ModAudio automatically detects your system's audio API:
+```python
+# Internal: device["hostapi"] tells us which API the device uses
+"WASAPI" (Windows) → use WASAPI device filtering
+"Core Audio" (macOS) → use Core Audio device filtering
+"PulseAudio" (Linux) → use PulseAudio device filtering
+"ALSA" (Linux) → use ALSA device filtering
+```
+
+For **multi-speaker mode**, ModAudio filters devices by API to ensure both speakers use the same audio subsystem for consistent behavior.
+
+---
+
+## CLI Reference
+
+Full command-line options for `main.py` (headless/streaming mode):
+
+```bash
+python main.py [OPTIONS]
+```
+
+### Device Selection
+- `-i, --input DEV` — Input device index (default: auto-detect)
+- `-o, --output DEV` — Output device index (default: auto-detect)
+- `--list-devices` — Print all available audio devices and exit
+
+### Audio Mode
+- `--mode {headphones|speakers}` — Processing mode (default: `headphones`)
+  - `headphones` = binaural HRTF rendering with spatial 5.1 processing
+  - `speakers` = stereo widening without binaural effects
+
+### Audio Parameters (all optional)
+- `--rt60 SECONDS` — Reverberation time (default: preset-dependent, typically 1.3s)
+- `--reverb-mix LEVEL` — Reverb wet level 0–1 (default: 0.25, i.e., 25%)
+- `--width MULTIPLIER` — Stereo width expansion (default: 2.0)
+- `--gain dB` — Output gain in dB (default: -1.5 dB)
+- `--drive INTENSITY` — Dynamics compression drive 1.0–2.0 (default: 1.6)
+
+### Audio Config
+- `--fs RATE` — Sample rate in Hz (default: 48000)
+- `--block-size SIZE` — Buffer size in samples (default: 512, ~10.7 ms latency)
+
+### Examples
+
+**Auto-detect all devices, apply cinema theater effect:**
+```bash
+python main.py
+```
+
+**Use specific devices with custom reverb and bass:**
+```bash
+python main.py -i 4 -o 7 --rt60 1.8 --width 2.5
+```
+
+**Streaming mode for headphones with aggressive dynamics:**
+```bash
+python main.py --mode headphones --drive 1.9 --gain -2
+```
+
+**List all devices to find indices:**
+```bash
+python main.py --list-devices
+```
+
+---
+
 ## Troubleshooting
 
-### No Sound Output
+### General Issues
+
+#### No Sound Output
 1. **Check device selection** — Ensure "Front Speaker" device matches your connected playback device
-2. **Verify system volume** — Make sure Windows volume is not muted
+2. **Verify system volume** — Ensure volume is not muted in system preferences
 3. **Check format** — Restart ModAudio if you switch devices
 4. **Test with silence** — Play a test tone to rule out source issues
+5. **Check audio source** — Ensure your input device is actually producing sound
 
-### Rear Speaker is Silent (Multi-Speaker Mode)
+#### Audio Crackling or Dropouts
+1. **Increase buffer size** — Raise `BLOCK_SIZE` in `config.py` (larger = more latency but fewer dropouts)
+2. **Close CPU-intensive apps** — Reduce load from other applications (browsers, video players, etc.)
+3. **Check USB power** — Ensure USB audio interface has adequate power supply
+4. **Update drivers** — Update audio drivers for your device
+   - **Windows:** Device Manager → Audio devices → Right-click → Update driver
+   - **macOS:** System Preferences → Software Update
+   - **Linux:** `sudo apt update && sudo apt upgrade` (Debian/Ubuntu)
+
+#### App Crashes on Launch
+1. **Check Python version** — Ensure Python 3.8+ is installed (`python --version`)
+2. **Reinstall dependencies** — `pip install -r requirements.txt --force-reinstall`
+3. **Check for missing modules** — Run `python -c "import sounddevice; print('OK')"` to verify sound library
+
+---
+
+### Windows-Specific Issues
+
+#### "No suitable input device found" Error
+**Error message:**
+```
+ERROR: No suitable input device found.
+Install VB-Cable or enable Stereo Mix, then re-run.
+```
+
+**Solution 1: Install VB-Cable (Recommended)**
+1. Download from https://vb-audio.com/Cable/
+2. Run `VB-Cable_Setup.exe` as Administrator
+3. Restart your computer
+4. Verify in Settings → Sound → Volume mixer → "VB-Cable" appears
+
+**Solution 2: Enable Stereo Mix (Built-in)**
+1. Right-click speaker icon → Sound settings
+2. Scroll down → Volume mixer → App volume and device preferences
+3. Under "Recording", right-click → Show disabled devices
+4. Find "Stereo Mix" → Enable
+5. Right-click → Set as default recording device
+6. Restart ModAudio
+
+#### VB-Cable Driver Installation Fails
+1. **Run as Administrator** — Right-click installer and select "Run as Administrator"
+2. **Disable Secure Boot** (if needed) — Temporarily disable in BIOS/UEFI if installation fails
+3. **Restart after install** — VB-Cable requires a full system restart to activate
+4. **Check Windows Defender** — Temporarily disable real-time protection if it blocks installation
+5. **Use Compatibility Mode** (last resort) — Right-click installer → Properties → Compatibility → Run in compatibility mode for older Windows version
+
+#### Rear Speaker is Silent (Multi-Speaker Mode)
 1. **Verify VB-Cable installation** — Open Sound settings and look for "VB-Cable" device
 2. **Check rear speaker connection** — Ensure speakers are powered and cables are connected
 3. **Adjust rear level slider** — Increase "Rear Level" in multi-speaker controls
-4. **Check audio source** — Some content has minimal surround information; test with surround-encoded material
+4. **Check audio source** — Some content has minimal surround information; test with surround-encoded movie or music
+5. **Verify loopback mode is selected** — In Multi-Speaker tab, check that rear device is set to VB-Cable
 
-### VB-Cable Driver Installation Fails
-1. **Run as Administrator** — Right-click installer and select "Run as Administrator"
-2. **Disable Secure Boot** — Temporarily disable in BIOS if installation still fails
-3. **Restart after install** — VB-Cable requires a system restart to activate
+---
 
-### Audio Crackling or Dropouts
-1. **Increase buffer size** — Raise BLOCK_SIZE in config.py (larger = more latency but fewer dropouts)
-2. **Close CPU-intensive apps** — Reduce load from other applications
-3. **Check USB power** — Ensure USB audio interface has adequate power
-4. **Update drivers** — Update audio drivers for your device
+### macOS-Specific Issues
 
-### Surround Not Noticeable (Multi-Speaker Mode)
-1. **Check rear speaker placement** — Rear speaker should be 3–6 ft away from listening position
-2. **Test with surround content** — Some audio has minimal surround encoding; use a movie or surround-encoded music
+#### "No suitable input device found" Error
+**Error message:**
+```
+ERROR: No suitable input device found.
+Install VB-Cable for Mac or BlackHole, then re-run.
+```
+
+**Solution 1: Install VB-Cable for Mac (Recommended)**
+1. Download from https://vb-audio.com/Cable/
+2. Mount the DMG file and run the installer
+3. Restart your Mac
+4. Verify in System Preferences → Sound → Input tab → "VB-Cable" appears
+
+**Solution 2: Install BlackHole (Open-source Alternative)**
+1. Download from https://github.com/ExistentialAudio/BlackHole/releases
+2. Mount the DMG and run the installer
+3. Restart your Mac
+4. Verify in System Preferences → Sound → Input tab → "BlackHole" appears
+
+#### Core Audio Permission Issues
+- If ModAudio fails to access audio devices, verify:
+  - System Preferences → Security & Privacy → Microphone (allow ModAudio/Python)
+  - Restart ModAudio after granting permissions
+
+#### Virtual Audio Device Not Detected
+1. **Verify installation** — Open System Preferences → Sound → Input tab
+2. **Look for VB-Cable or BlackHole** — Check both input and output tabs
+3. **Restart audio system** — Run: `sudo launchctl stop com.apple.audio.AudioComponentRegistrar && sleep 2 && sudo launchctl start com.apple.audio.AudioComponentRegistrar`
+4. **Restart Mac** — Full restart may be required for Core Audio to recognize new devices
+
+#### Low Audio or No Output on Apple Silicon (M1/M2)
+- Apple Silicon may have reduced audio buffer performance on first run
+- Increase `BLOCK_SIZE` in `config.py` from 512 to 1024
+- Restart ModAudio
+
+---
+
+### Linux-Specific Issues
+
+#### "No suitable input device found" Error
+**Error message:**
+```
+ERROR: No suitable input device found.
+Install a virtual loopback device (e.g. VB-Cable), then re-run.
+```
+
+**Solution 1: Use Native PulseAudio Loopback (Recommended)**
+1. PulseAudio loopback is usually pre-installed on most Linux distributions
+2. Verify loopback module exists:
+   ```bash
+   pactl list modules | grep loopback
+   ```
+3. If missing, install PulseAudio:
+   ```bash
+   sudo apt install pulseaudio pulseaudio-utils  # Debian/Ubuntu
+   sudo dnf install pulseaudio                    # Fedora
+   ```
+4. Restart audio daemon:
+   ```bash
+   systemctl --user restart pulseaudio
+   ```
+5. ModAudio should auto-detect the loopback device on next run
+
+**Solution 2: Install VB-Cable for Linux**
+1. Visit https://vb-audio.com/Cable/
+2. Follow Linux installation instructions
+3. Compile and install module
+4. Verify: `pactl list modules | grep vcable`
+
+#### ALSA Device Numbering Issues
+If `--list-devices` shows device indices but they change after reboot:
+1. **Create ALSA device mapping:**
+   ```bash
+   sudo nano /etc/asound.conf
+   ```
+2. Add permanent device aliases:
+   ```conf
+   pcm.default {
+       type hw
+       card PCH
+   }
+   ctl.default {
+       type hw
+       card PCH
+   }
+   ```
+3. Save and restart audio: `systemctl --user restart pulseaudio`
+
+#### PulseAudio/ALSA Conflicts
+If both are present and conflicting:
+1. Check which is primary: `pactl info | grep "Server name"`
+2. Force PulseAudio: `export PULSE_SERVER=tcp:127.0.0.1:4713` before running ModAudio
+3. Force ALSA: Install PulseAudio ALSA plugin: `sudo apt install libasound2-plugins`
+
+#### Permission Denied on Audio Device
+```bash
+# If you see: "Permission denied" errors
+# Add your user to audio group:
+sudo usermod -a -G audio $USER
+
+# Apply group changes (logout/login or):
+newgrp audio
+```
+
+---
+
+### Multi-Speaker Mode Issues (All Platforms)
+
+#### Rear Speaker is Silent
+1. **Verify virtual loopback installed** — See OS-specific sections above
+2. **Check rear speaker connection** — Ensure speakers are powered and cables are connected
+3. **Adjust rear level slider** — Increase "Rear Level" in multi-speaker controls
+4. **Check audio source** — Test with surround-encoded content (movies in 5.1 format)
+5. **Verify device selection** — In Multi-Speaker tab, ensure rear device is the loopback device (not speakers)
+
+#### Surround Not Noticeable
+1. **Check rear speaker placement** — Rear speaker should be 3–6 feet away from listening position
+2. **Test with surround content** — Use movies in surround formats (5.1, 7.1) or surround-encoded music
 3. **Increase surround level** — Raise "Surround Level" slider in multi-speaker tab
-4. **Verify rear azimuth** — Adjust rear position slider to match your physical speaker placement
+4. **Verify rear azimuth** — Adjust rear position slider (90°–170°) to match your physical speaker placement
+5. **Check center level** — Reduce "Center Level" to emphasize surround channels
+
+#### Audio Latency Issues (Multi-Speaker)
+1. **Verify loopback latency** — Loopback devices add ~50–100 ms naturally
+2. **Reduce buffer size** — Lower `BLOCK_SIZE` in `config.py` to 256 (risks dropouts but lowers latency)
+3. **Check speaker acoustic delay** — Ensure "Speaker Acoustic Delay" slider is configured (~3 ms per meter of distance)
+4. **Update drivers** — Outdated audio drivers can cause latency; update via system settings
 
 ---
 
@@ -361,17 +751,41 @@ Requires manual device selection in ModAudio's Device dropdown.
 
 ## Performance & Compatibility
 
-### Recommended System
-- **CPU:** Intel i7/Ryzen 7 or better (quad-core minimum)
+### Recommended System (All Platforms)
+- **CPU:**
+  - **Windows:** Intel i7/Ryzen 7 or better (quad-core minimum)
+  - **macOS:** Apple M1/M2 or Intel i7 equivalent
+  - **Linux:** Ryzen 5/i5 or better (quad-core minimum)
 - **RAM:** 8 GB minimum (16 GB recommended)
+- **Storage:** ~200 MB for dependencies
 - **Audio Interface:** USB 2.0+ (USB 3.0 recommended for multi-speaker)
-- **Latency:** ~10–20 ms typical roundtrip
+- **Latency:**
+  - Windows WASAPI: ~10–20 ms typical roundtrip
+  - macOS Core Audio: ~5–10 ms (Apple Silicon even lower)
+  - Linux PulseAudio: ~10–20 ms typical roundtrip
 
 ### Tested On
+
+**Windows:**
 - Windows 10 22H2
 - Windows 11 Home & Pro
-- VB-Cable 4.x
 - Python 3.9–3.12
+
+**macOS:**
+- macOS 12.x, 13.x, 14.x (Intel)
+- macOS 13.x, 14.x (Apple Silicon M1/M2)
+- Python 3.9–3.12
+
+**Linux:**
+- Ubuntu 20.04 LTS, 22.04 LTS
+- Debian 11, 12
+- Fedora 37, 38
+- Python 3.9–3.12
+
+**Virtual Audio Devices:**
+- VB-Cable 4.x (Windows & macOS)
+- BlackHole 0.6+ (macOS)
+- PulseAudio loopback module (Linux)
 
 ---
 
@@ -379,13 +793,14 @@ Requires manual device selection in ModAudio's Device dropdown.
 
 ```
 ModAudio/
-├── app.py                 # Main GUI application
+├── app.py                 # Main GUI application (Windows, macOS, Linux)
+├── main.py                # CLI application for headless/streaming use
 ├── config.py              # Audio parameters & theater presets
-├── requirements.txt       # Python dependencies
+├── requirements.txt       # Python dependencies (cross-platform)
 ├── README.md              # This file
-├── audio_io.py            # Device enumeration and management
-├── audio_multi.py         # Multi-speaker audio streaming
-├── virtual_device.py      # Virtual audio driver setup (Windows)
+├── audio_io.py            # Device enumeration (cross-platform)
+├── audio_multi.py         # Multi-speaker audio streaming (cross-platform)
+├── virtual_device.py      # Virtual audio setup (cross-platform with platform-specific branches)
 ├── dsp/
 │   ├── __init__.py
 │   ├── surround_engine.py # Adaptive 7.1 surround upmix
@@ -405,23 +820,123 @@ ModAudio/
 
 ## License
 
-This project is provided as-is for personal and educational use.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) file for details.
 
 ---
 
 ## Contributing & Support
 
-### Issues & Feature Requests
-If you encounter bugs or have feature suggestions:
-1. Test with the included presets
-2. Check troubleshooting section above
-3. Provide details: audio device, OS version, steps to reproduce
+**ModAudio is an open-source project, and contributions are welcome!** Whether you're fixing bugs, adding features, improving documentation, or testing on new platforms, your help makes ModAudio better for everyone.
+
+### Reporting Issues
+
+If you encounter bugs or unexpected behavior:
+
+1. **Check existing issues** — Search https://github.com/yourusername/ModAudio/issues to avoid duplicates
+2. **Test with included presets** — Try the default presets (Cinema, IMAX, Dolby, Home) to isolate custom vs. preset issues
+3. **Review troubleshooting** — See the Troubleshooting section above for common solutions
+4. **Provide diagnostic information:**
+   - Operating system and version (e.g., "Windows 11 22H2", "macOS 14.2 M1", "Ubuntu 22.04")
+   - Python version (`python --version`)
+   - Audio device name and type (e.g., "Realtek ALC1200", "USB interface XYZ")
+   - Steps to reproduce the issue
+   - Error message or console output (if any)
+   - Audio configuration (single-speaker vs. multi-speaker mode)
+
+**Example issue:**
+```
+Title: Crackling audio on multi-speaker mode with VB-Cable
+
+OS: Windows 11 Pro 22H2
+Python: 3.11.2
+Devices: Logitech USB Headset (front), VB-Cable (rear)
+Mode: Multi-speaker, IMAX preset
+
+Steps:
+1. Set up two speakers
+2. Select VB-Cable as rear device
+3. Click "Start" in multi-speaker tab
+4. Play 5.1 movie
+
+Result: Audio crackles every ~2 seconds on rear speaker
+
+Expected: Smooth multi-speaker playback
+```
+
+### Feature Requests & Enhancement Ideas
+
+Have an idea for ModAudio? We'd love to hear it:
+
+- **New audio effects or presets** — Propose cinema modes for different genres or styles
+- **UI/UX improvements** — Suggest better control layouts or visualization
+- **Platform support** — Help test on new systems or Linux distributions
+- **Performance optimization** — Ideas for reducing CPU usage or improving latency
+- **Documentation** — Help improve guides for specific platforms or workflows
+
+Open a GitHub issue with tag `[Feature Request]` and describe your idea.
+
+### Contributing Code
+
+**Setup for development:**
+
+```bash
+git clone https://github.com/yourusername/ModAudio.git
+cd ModAudio
+git checkout -b feature/your-feature-name  # Create feature branch
+pip install -r requirements.txt
+python app.py  # Test your changes
+```
+
+**Guidelines for pull requests:**
+
+1. **One feature per PR** — Keep PRs focused and reviewable
+2. **Test on your platform** — Verify changes work on Windows/macOS/Linux as applicable
+3. **No breaking changes** — Ensure backward compatibility with existing presets and settings
+4. **Maintain code style** — Follow existing naming and formatting conventions
+5. **Document complex code** — Add comments for non-obvious algorithms or DSP operations
+6. **Update README if needed** — If you add features, update documentation
+
+**Areas where contributions are especially welcome:**
+
+- Cross-platform testing and bug fixes
+- Audio API improvements (WASAPI/Core Audio/ALSA optimizations)
+- GUI enhancements (preset management, custom controls, visualization)
+- DSP algorithms (new filters, reverb designs, spatial processing)
+- Performance optimization (reduce CPU usage, lower latency)
+- Documentation and tutorials
+- Linux package support (AppImage, Snap, etc.)
+
+### Testing & Quality Assurance
+
+Help us test ModAudio on different systems:
+
+- **Windows:** Test on latest Windows 11, older Windows 10 versions, different audio devices
+- **macOS:** Test on Intel and Apple Silicon machines; both VB-Cable and BlackHole
+- **Linux:** Test on Ubuntu, Debian, Fedora; with PulseAudio and ALSA
+- **Audio devices:** Test with USB interfaces, Bluetooth devices, built-in audio
+- **Multi-speaker scenarios:** Test different speaker placements and configurations
+
+Report findings (working/broken combinations) to help guide development.
+
+### Getting Help
+
+- **Documentation:** Check this README first, especially the Troubleshooting section
+- **GitHub Discussions:** Ask questions in GitHub Discussions (if enabled)
+- **GitHub Issues:** Report bugs or request features
+- **Community:** Check existing closed issues for solutions to similar problems
 
 ### Credits
-- **Brown-Duda HRTF** — Spatial audio rendering
-- **VB-Cable** — Virtual audio routing (https://vb-audio.com)
+
+ModAudio stands on the shoulders of excellent open-source and commercial projects:
+
+- **Brown-Duda HRTF** — Spatial audio rendering reference
 - **NumPy/SciPy** — Signal processing backbone
-- **customtkinter** — Modern cross-platform GUI
+- **sounddevice** — Cross-platform audio I/O (https://github.com/spatialaudio/python-sounddevice)
+- **customtkinter** — Modern cross-platform GUI (https://github.com/TomSchimansky/CustomTkinter)
+- **VB-Cable** — Virtual audio routing (https://vb-audio.com)
+- **BlackHole** — Open-source virtual audio device (https://github.com/ExistentialAudio/BlackHole)
+
+Special thanks to all contributors and the audio DSP community.
 
 ---
 
