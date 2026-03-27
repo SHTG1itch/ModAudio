@@ -156,22 +156,35 @@ class _AdaptiveUpmix71:
         # --- Adaptive gains -----------------------------------------------
 
         # Coherence → surround scale
-        # More diffuse audio = more surround presence
-        surr_scale = 0.5 + (1.0 - coh) * 0.9   # range [0.5, 1.4]
+        # More diffuse audio (music, ambience) = wider surround envelope.
+        # Correlated (mono, dialog) = quieter surrounds so dialog stays front.
+        surr_scale = 0.55 + (1.0 - coh) * 1.0   # range [0.55, 1.55]
 
-        # Pan extension: hard-left/right feeds into corresponding surround
-        # Dead-zone ±0.35; full extension 0.30 at ±1.0
-        if pan < -0.35:
-            ls_ext = float(np.clip((-pan - 0.35) / 0.65, 0.0, 1.0)) * 0.30
+        # Pan extension: hard-left/right feeds into corresponding surround channel.
+        # This is the key mechanism for "wrap-around" movement —
+        # when audio sweeps left→right the LS/RS channels get direct bleed
+        # which then routes to the rear speaker via the VBAP matrix, giving the
+        # perception that the sound moves from the front around the head.
+        # Dead-zone ±0.30; full extension 0.55 at ±1.0
+        if pan < -0.30:
+            pan_frac = float(np.clip((-pan - 0.30) / 0.70, 0.0, 1.0))
+            ls_ext = pan_frac * 0.55
+            lb_ext = pan_frac * 0.22   # pan also bleeds into back channel
         else:
             ls_ext = 0.0
-        if pan > 0.35:
-            rs_ext = float(np.clip((pan - 0.35) / 0.65, 0.0, 1.0)) * 0.30
+            lb_ext = 0.0
+        if pan > 0.30:
+            pan_frac = float(np.clip((pan - 0.30) / 0.70, 0.0, 1.0))
+            rs_ext = pan_frac * 0.55
+            rb_ext = pan_frac * 0.22
         else:
             rs_ext = 0.0
+            rb_ext = 0.0
 
         LS = LS_ap * surr_scale + L * ls_ext
         RS = RS_ap * surr_scale + R * rs_ext
+        LB_out = LB * surr_scale + L * lb_ext
+        RB_out = RB * surr_scale + R * rb_ext
 
         return {
             "FL": L,
@@ -179,8 +192,8 @@ class _AdaptiveUpmix71:
             "C":  C,
             "LS": LS,
             "RS": RS,
-            "LB": LB * surr_scale,
-            "RB": RB * surr_scale,
+            "LB": LB_out,
+            "RB": RB_out,
         }
 
     def reset(self):
