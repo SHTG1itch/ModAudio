@@ -1,4 +1,5 @@
 # ModAudio - Theater Experience for Your Speakers & Headphones
+DISLCAIMER: If it sounds too quiet, then change the volume of your speakers (like through the OS's volume control). ESPECIALLY ON WINDOWS.
 
 Transform your audio playback into an immersive theater experience with **ModAudio**, a professional-grade DSP (Digital Signal Processing) application that brings cinema-quality surround sound to any speaker setup or headphones.
 
