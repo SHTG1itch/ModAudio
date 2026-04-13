@@ -23,7 +23,8 @@ import sounddevice as sd
 from config      import HEADPHONES_PRESET, SPEAKERS_PRESET, SAMPLE_RATE, BLOCK_SIZE
 from audio_io    import find_default_devices
 from dsp         import TheaterChain
-from audio_multi import MultiDeviceStream, is_bluetooth_device
+from audio_multi import MultiDeviceStream, MultiSpeakerStreamN, is_bluetooth_device
+from room_canvas_3d import Room3DCanvas, SPEAKER_LAYOUTS_3D, CHANNEL_DIRECTIONS, DIRECTION_TO_SPEAKER
 try:
     import virtual_device as _vdev
     _HAS_VDEV = True
@@ -118,7 +119,7 @@ C = {
 
 class ModAudioApp(ctk.CTk):
 
-    W, H = 520, 860
+    W, H = 660, 900
 
     def __init__(self):
         super().__init__()
@@ -166,6 +167,19 @@ class ModAudioApp(ctk.CTk):
         self._ms_preset_name    = "Cinema"      # theater mode for multi-speaker
         self._ms_rear_az_deg    = 150.0         # rear speaker azimuth (90–170°)
         self._ms_acoustic_delay = 0.0           # speaker distance delay (ms)
+
+        # N-speaker room canvas state
+        # Each entry: {sid, label, device_idx, device_label, azimuth, distance}
+        self._ms_speakers: list[dict] = []
+        self._room_canvas: "Room3DCanvas | None" = None
+        self._ms_selected_sid: "int | None" = None
+        # Per-speaker RMS smoothing (sid → np.ndarray([L,R]))
+        self._ms_dsp_per_spk: dict = {}
+        self._ms_room_w = 6.0   # metres
+        self._ms_room_d = 5.0
+        self._ms_room_h = 3.0
+        # Dynamic output device rows (each: dict with frame/dev_menu/dir_menu/etc.)
+        self._ms_output_rows: list[dict] = []
 
         # -- Discover audio devices
         self._devs     = sd.query_devices()
@@ -971,52 +985,36 @@ class ModAudioApp(ctk.CTk):
                                 padx=14, pady=(0, 4), sticky="ew")
         self._ms_dual_note.grid_remove()   # hidden by default (rear_only)
 
-        # Front / Rear output dropdowns with Bass Priority buttons
-        names_all = [label for _, label in self._all_out_list]
-        self._ms_bass_btns = {}   # side → CTkButton
+        # Dynamic output device rows
+        self._ms_bass_btns = {}   # kept for backward compat
         f_dev.grid_columnconfigure(2, weight=0)
-        for r, (lbl_txt, attr_idx, attr_menu, side) in enumerate([
-            ("Front Out", "_ms_front_idx", "_ms_front_menu", "front"),
-            ("Rear Out",  "_ms_rear_idx",  "_ms_rear_menu",  "rear"),
-        ], start=2):
-            ctk.CTkLabel(
-                f_dev, text=lbl_txt,
-                font=ctk.CTkFont(size=12), text_color=C["dim"],
-                width=68, anchor="w",
-            ).grid(row=r, column=0, padx=(14, 6), pady=8, sticky="w")
 
-            cur_idx  = getattr(self, attr_idx)
-            cur_name = next((l for i, l in self._all_out_list if i == cur_idx),
-                            names_all[0] if names_all else "")
-            menu = ctk.CTkOptionMenu(
-                f_dev,
-                values=names_all if names_all else ["No output devices"],
-                font=ctk.CTkFont(size=11),
-                fg_color=C["surface2"],
-                button_color=C["accent"],
-                button_hover_color="#5a73f5",
-                dropdown_fg_color=C["surface2"],
-                dropdown_hover_color=C["surface"],
-                corner_radius=7, height=32,
-                command=lambda v, am=attr_menu, ai=attr_idx: self._on_ms_device_change(v, am, ai),
-            )
-            menu.set(cur_name)
-            menu.grid(row=r, column=1, padx=(0, 6), pady=8, sticky="ew")
-            setattr(self, attr_menu, menu)
+        # Scrollable container for dynamic output rows
+        self._ms_out_rows_frame = ctk.CTkFrame(f_dev, fg_color="transparent")
+        self._ms_out_rows_frame.grid(row=2, column=0, columnspan=3,
+                                     padx=8, pady=(4, 0), sticky="ew")
+        self._ms_out_rows_frame.grid_columnconfigure(0, weight=1)
 
-            bass_btn = ctk.CTkButton(
-                f_dev, text="Bass ♦",
-                font=ctk.CTkFont(size=10),
-                fg_color=C["surface2"],
-                hover_color=C["surface"],
-                border_color=C["dim"],
-                border_width=1,
-                text_color=C["dim"],
-                corner_radius=7, height=32, width=68,
-                command=lambda s=side: self._on_ms_bass_priority(s),
-            )
-            bass_btn.grid(row=r, column=2, padx=(0, 14), pady=8)
-            self._ms_bass_btns[side] = bass_btn
+        # "+ Add Device" button row
+        f_add_out = ctk.CTkFrame(f_dev, fg_color="transparent")
+        f_add_out.grid(row=3, column=0, columnspan=3,
+                       padx=8, pady=(2, 8), sticky="w")
+        ctk.CTkButton(
+            f_add_out, text="+ Add Device",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            height=26, width=110,
+            fg_color=C["accent"], hover_color="#5a73f5",
+            text_color="white", corner_radius=6,
+            command=self._ms_add_output_row,
+        ).pack(side="left")
+
+        # Seed with default Front L/R and Rear L/R rows
+        _init_front_name = next((l for i, l in self._all_out_list
+                                 if i == self._ms_front_idx), "")
+        _init_rear_name  = next((l for i, l in self._all_out_list
+                                 if i == self._ms_rear_idx), "")
+        self._ms_add_output_row(device_name=_init_front_name, direction="Front L/R")
+        self._ms_add_output_row(device_name=_init_rear_name,  direction="Rear L/R")
 
         # --- BLUETOOTH DELAY -------------------------------------------------
         self._build_section("BLUETOOTH DELAY", pad, parent=ms)
@@ -1100,123 +1098,206 @@ class ModAudioApp(ctk.CTk):
         self._ms_lbl_comp_dir.grid(row=4, column=0, columnspan=2,
                                    padx=14, pady=(0, 10), sticky="ew")
 
-        # --- SPEAKER PLACEMENT -----------------------------------------------
+        # --- SPEAKER PLACEMENT (room canvas) ---------------------------------
         self._build_section("SPEAKER PLACEMENT", pad, parent=ms)
-        f_place = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=10)
-        f_place.pack(fill="x", padx=pad, pady=(0, 4))
-        f_place.grid_columnconfigure(1, weight=1)
 
-        # Row 0: Orientation toggle (Faces Me / Faces Away)
-        ctk.CTkLabel(
-            f_place, text="Orientation",
-            font=ctk.CTkFont(size=12), text_color=C["dim"],
-            width=90, anchor="w",
-        ).grid(row=0, column=0, padx=(14, 6), pady=(12, 4), sticky="w")
+        # ---- Room canvas ------------------------------------------------
+        f_canvas_outer = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=10)
+        f_canvas_outer.pack(fill="x", padx=pad, pady=(0, 4))
 
-        self._ms_orient_seg = ctk.CTkSegmentedButton(
-            f_place,
-            values=["Faces Me", "Faces Away"],
-            font=ctk.CTkFont(size=11),
-            height=30,
-            selected_color=C["accent"],
-            selected_hover_color="#5a73f5",
-            corner_radius=7,
-            command=self._on_ms_orient_change,
+        canvas_w = self.W - pad * 2 - 4
+        canvas_h = 340
+        self._room_canvas = Room3DCanvas(
+            f_canvas_outer,
+            canvas_width=canvas_w,
+            canvas_height=canvas_h,
+            room_width_m=self._ms_room_w,
+            room_depth_m=self._ms_room_d,
+            room_height_m=self._ms_room_h,
+            on_speaker_moved=self._on_ms_speaker_moved,
+            on_speaker_selected=self._on_ms_speaker_selected,
+            on_speaker_rotated=self._on_ms_speaker_rotated,
+            on_change=self._on_ms_canvas_change,
         )
-        self._ms_orient_seg.set("Faces Me" if self._ms_swap_rear_lr else "Faces Away")
-        self._ms_orient_seg.grid(row=0, column=1, padx=(0, 14), pady=(12, 4), sticky="ew")
+        self._room_canvas.pack(fill="x", padx=2, pady=(4, 2))
 
-        # Keep the old swap switch hidden but functional for backward compat
+        # ---- Room dimension + layout controls ---------------------------
+        f_room_ctrl = ctk.CTkFrame(f_canvas_outer, fg_color="transparent")
+        f_room_ctrl.pack(fill="x", padx=8, pady=(2, 6))
+        for ci in range(9):
+            f_room_ctrl.grid_columnconfigure(ci, weight=1 if ci in (1, 3, 5) else 0)
+
+        # Room W
+        ctk.CTkLabel(f_room_ctrl, text="Room W:",
+                     font=ctk.CTkFont(size=10), text_color=C["dim"]).grid(
+            row=0, column=0, padx=(4, 2), pady=0, sticky="e")
+        self._ms_room_w_entry = ctk.CTkEntry(
+            f_room_ctrl, width=52, height=26,
+            fg_color=C["surface2"], border_color=C["dim"],
+            font=ctk.CTkFont(size=10, family="Consolas"))
+        self._ms_room_w_entry.insert(0, f"{self._ms_room_w:.1f}")
+        self._ms_room_w_entry.grid(row=0, column=1, padx=(0, 4), pady=0, sticky="ew")
+        self._ms_room_w_entry.bind("<Return>", lambda _: self._on_ms_room_dim_change())
+        self._ms_room_w_entry.bind("<FocusOut>", lambda _: self._on_ms_room_dim_change())
+
+        ctk.CTkLabel(f_room_ctrl, text="D:",
+                     font=ctk.CTkFont(size=10), text_color=C["dim"]).grid(
+            row=0, column=2, padx=(4, 2), pady=0, sticky="e")
+        self._ms_room_d_entry = ctk.CTkEntry(
+            f_room_ctrl, width=52, height=26,
+            fg_color=C["surface2"], border_color=C["dim"],
+            font=ctk.CTkFont(size=10, family="Consolas"))
+        self._ms_room_d_entry.insert(0, f"{self._ms_room_d:.1f}")
+        self._ms_room_d_entry.grid(row=0, column=3, padx=(0, 4), pady=0, sticky="ew")
+        self._ms_room_d_entry.bind("<Return>", lambda _: self._on_ms_room_dim_change())
+        self._ms_room_d_entry.bind("<FocusOut>", lambda _: self._on_ms_room_dim_change())
+
+        ctk.CTkLabel(f_room_ctrl, text="H:",
+                     font=ctk.CTkFont(size=10), text_color=C["dim"]).grid(
+            row=0, column=4, padx=(4, 2), pady=0, sticky="e")
+        self._ms_room_h_entry = ctk.CTkEntry(
+            f_room_ctrl, width=48, height=26,
+            fg_color=C["surface2"], border_color=C["dim"],
+            font=ctk.CTkFont(size=10, family="Consolas"))
+        self._ms_room_h_entry.insert(0, f"{self._ms_room_h:.1f}")
+        self._ms_room_h_entry.grid(row=0, column=5, padx=(0, 8), pady=0, sticky="ew")
+        self._ms_room_h_entry.bind("<Return>", lambda _: self._on_ms_room_dim_change())
+        self._ms_room_h_entry.bind("<FocusOut>", lambda _: self._on_ms_room_dim_change())
+
+        # Layout preset buttons
+        _layout_names = list(SPEAKER_LAYOUTS_3D.keys())
+        for ci, lname in enumerate(_layout_names):
+            short = lname.replace(" Cinema", "").replace(" Dolby", "")
+            btn = ctk.CTkButton(
+                f_room_ctrl, text=short,
+                font=ctk.CTkFont(size=9),
+                height=26, width=70,
+                fg_color=C["surface2"], hover_color=C["surface"],
+                border_color=C["dim"], border_width=1,
+                text_color=C["text"], corner_radius=5,
+                command=lambda n=lname: self._on_ms_layout_preset(n),
+            )
+            btn.grid(row=1, column=ci, padx=(2, 0), pady=(2, 0))
+
+        # Add-speaker button (after layout presets)
+        ctk.CTkButton(
+            f_room_ctrl, text="+ Add",
+            font=ctk.CTkFont(size=9, weight="bold"),
+            height=26, width=52,
+            fg_color=C["accent"], hover_color="#5a73f5",
+            text_color="white", corner_radius=5,
+            command=self._on_ms_add_speaker,
+        ).grid(row=1, column=len(_layout_names), padx=(4, 2), pady=(2, 0))
+
+        # ---- Selected-speaker panel (hidden until a speaker is selected) --
+        self._ms_spk_panel = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=10)
+        self._ms_spk_panel.pack(fill="x", padx=pad, pady=(0, 4))
+        self._ms_spk_panel.grid_columnconfigure(1, weight=1)
+        self._ms_spk_panel.grid_columnconfigure(3, weight=1)
+
+        # Row 0: speaker id label + device assignment
+        self._ms_spk_title = ctk.CTkLabel(
+            self._ms_spk_panel, text="No speaker selected",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=C["dim"], anchor="w",
+        )
+        self._ms_spk_title.grid(row=0, column=0, columnspan=2,
+                                padx=14, pady=(10, 4), sticky="ew")
+
+        # Device dropdown for selected speaker
+        ctk.CTkLabel(self._ms_spk_panel, text="Assign device:",
+                     font=ctk.CTkFont(size=11), text_color=C["dim"],
+                     anchor="w").grid(row=1, column=0, padx=(14, 6),
+                                      pady=(0, 4), sticky="w")
+        names_all = [label for _, label in self._all_out_list]
+        self._ms_spk_dev_menu = ctk.CTkOptionMenu(
+            self._ms_spk_panel,
+            values=names_all if names_all else ["No output devices"],
+            font=ctk.CTkFont(size=10),
+            fg_color=C["surface2"],
+            button_color=C["accent"], button_hover_color="#5a73f5",
+            dropdown_fg_color=C["surface2"], dropdown_hover_color=C["surface"],
+            corner_radius=7, height=30,
+            command=self._on_ms_spk_dev_change,
+        )
+        self._ms_spk_dev_menu.grid(row=1, column=1, columnspan=2,
+                                   padx=(0, 6), pady=(0, 4), sticky="ew")
+
+        # Remove button
+        self._ms_spk_remove_btn = ctk.CTkButton(
+            self._ms_spk_panel, text="Remove",
+            font=ctk.CTkFont(size=10),
+            fg_color=C["danger"], hover_color="#f56070",
+            text_color="white", corner_radius=7, height=30, width=80,
+            command=self._on_ms_remove_speaker,
+        )
+        self._ms_spk_remove_btn.grid(row=1, column=3, padx=(0, 14),
+                                     pady=(0, 4), sticky="e")
+
+        # Facing azimuth slider
+        ctk.CTkLabel(self._ms_spk_panel, text="Face Az:",
+                     font=ctk.CTkFont(size=10), text_color=C["dim"],
+                     anchor="w").grid(row=2, column=0, padx=(14, 4),
+                                      pady=(0, 2), sticky="w")
+        self._ms_face_az_slider = ctk.CTkSlider(
+            self._ms_spk_panel, from_=0, to=360, number_of_steps=72,
+            height=20,
+            fg_color=C["surface2"], progress_color=C["accent"],
+            button_color=C["accent"], button_hover_color="#5a73f5",
+            command=self._on_ms_face_slider_change,
+        )
+        self._ms_face_az_slider.set(0)
+        self._ms_face_az_slider.grid(row=2, column=1, columnspan=2,
+                                     padx=(0, 4), pady=(0, 2), sticky="ew")
+        self._ms_lbl_face_az = ctk.CTkLabel(
+            self._ms_spk_panel, text="0°",
+            font=ctk.CTkFont(size=10, family="Consolas"),
+            text_color=C["dim"], width=36, anchor="e",
+        )
+        self._ms_lbl_face_az.grid(row=2, column=3, padx=(0, 14), pady=(0, 2), sticky="e")
+
+        # Facing elevation slider
+        ctk.CTkLabel(self._ms_spk_panel, text="Face El:",
+                     font=ctk.CTkFont(size=10), text_color=C["dim"],
+                     anchor="w").grid(row=3, column=0, padx=(14, 4),
+                                      pady=(0, 4), sticky="w")
+        self._ms_face_el_slider = ctk.CTkSlider(
+            self._ms_spk_panel, from_=-90, to=90, number_of_steps=36,
+            height=20,
+            fg_color=C["surface2"], progress_color=C["accent"],
+            button_color=C["accent"], button_hover_color="#5a73f5",
+            command=self._on_ms_face_slider_change,
+        )
+        self._ms_face_el_slider.set(0)
+        self._ms_face_el_slider.grid(row=3, column=1, columnspan=2,
+                                     padx=(0, 4), pady=(0, 4), sticky="ew")
+        self._ms_lbl_face_el = ctk.CTkLabel(
+            self._ms_spk_panel, text="0°",
+            font=ctk.CTkFont(size=10, family="Consolas"),
+            text_color=C["dim"], width=36, anchor="e",
+        )
+        self._ms_lbl_face_el.grid(row=3, column=3, padx=(0, 14), pady=(0, 4), sticky="e")
+
+        # Orientation hint
+        ctk.CTkLabel(
+            self._ms_spk_panel,
+            text="Drag dots to reposition  ·  Shift-drag to adjust height  ·  "
+                 "Right-click for orientation presets  ·  Use sliders above for precise rotation",
+            font=ctk.CTkFont(size=9), text_color=C["dim"],
+            anchor="w", wraplength=600,
+        ).grid(row=4, column=0, columnspan=4, padx=14, pady=(0, 8), sticky="ew")
+
+        # ---- Backwards-compat stubs (referenced by existing handlers) ----
+        # Hidden widgets so old orientation/azimuth handlers don't error
         self._ms_swap_switch = ctk.CTkSwitch(
-            f_place, text="", fg_color=C["surface2"],
+            f_canvas_outer, text="", fg_color=C["surface2"],
             command=self._on_ms_swap_toggle,
         )
         if self._ms_swap_rear_lr:
             self._ms_swap_switch.select()
-        else:
-            self._ms_swap_switch.deselect()
-        # Hidden — orientation is set via segment button above
 
-        # Orientation hint
-        self._ms_orient_hint = ctk.CTkLabel(
-            f_place,
-            text="'Faces Me': rear speaker turned toward you (L/R swapped). "
-                 "'Faces Away': speaker points into the wall.",
-            font=ctk.CTkFont(size=10), text_color=C["dim"],
-            anchor="w", justify="left", wraplength=400,
-        )
-        self._ms_orient_hint.grid(row=1, column=0, columnspan=2,
-                                  padx=14, pady=(0, 4), sticky="ew")
-
-        # Row 2: Rear speaker position (azimuth) slider
-        ctk.CTkLabel(
-            f_place, text="Position",
-            font=ctk.CTkFont(size=12), text_color=C["dim"],
-            width=90, anchor="w",
-        ).grid(row=2, column=0, padx=(14, 6), pady=(6, 4), sticky="w")
-
-        f_az_row = ctk.CTkFrame(f_place, fg_color="transparent")
-        f_az_row.grid(row=2, column=1, padx=(0, 14), pady=(6, 4), sticky="ew")
-        f_az_row.grid_columnconfigure(0, weight=1)
-
-        self._ms_az_slider = ctk.CTkSlider(
-            f_az_row, from_=90.0, to=170.0, height=16,
-            button_color=C["accent"], button_hover_color="#5a73f5",
-            progress_color=C["accent"], fg_color=C["surface2"], corner_radius=4,
-            command=self._on_ms_az_slider,
-        )
-        self._ms_az_slider.set(self._ms_rear_az_deg)
-        self._ms_az_slider.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-
-        self._ms_lbl_az = ctk.CTkLabel(
-            f_az_row, text=f"{self._ms_rear_az_deg:.0f}°",
-            font=ctk.CTkFont(size=11, family="Consolas"),
-            text_color=C["success"], width=44, anchor="e",
-        )
-        self._ms_lbl_az.grid(row=0, column=1)
-
-        ctk.CTkLabel(
-            f_place,
-            text="90° = side-mounted  ·  150° = directly behind (default)  ·  "
-                 "Adjusts surround panning for physical speaker location.",
-            font=ctk.CTkFont(size=10), text_color=C["dim"],
-            anchor="w", justify="left", wraplength=400,
-        ).grid(row=3, column=0, columnspan=2, padx=14, pady=(0, 6), sticky="ew")
-
-        # Row 4: Acoustic delay (speaker distance compensation)
-        ctk.CTkLabel(
-            f_place, text="Spk delay",
-            font=ctk.CTkFont(size=12), text_color=C["dim"],
-            width=90, anchor="w",
-        ).grid(row=4, column=0, padx=(14, 6), pady=(4, 10), sticky="w")
-
-        f_spkd_row = ctk.CTkFrame(f_place, fg_color="transparent")
-        f_spkd_row.grid(row=4, column=1, padx=(0, 14), pady=(4, 10), sticky="ew")
-        f_spkd_row.grid_columnconfigure(0, weight=1)
-
-        self._ms_spkd_slider = ctk.CTkSlider(
-            f_spkd_row, from_=0.0, to=20.0, height=16,
-            button_color=C["accent"], button_hover_color="#5a73f5",
-            progress_color=C["accent"], fg_color=C["surface2"], corner_radius=4,
-            command=self._on_ms_spkd_slider,
-        )
-        self._ms_spkd_slider.set(self._ms_acoustic_delay)
-        self._ms_spkd_slider.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-
-        self._ms_lbl_spkd = ctk.CTkLabel(
-            f_spkd_row, text="0.0 ms",
-            font=ctk.CTkFont(size=11, family="Consolas"),
-            text_color=C["dim"], width=44, anchor="e",
-        )
-        self._ms_lbl_spkd.grid(row=0, column=1)
-
-        ctk.CTkLabel(
-            f_place,
-            text="Delay front speaker to align with a farther rear speaker "
-                 "(1 ms ≈ 34 cm / 13 in extra distance).",
-            font=ctk.CTkFont(size=10), text_color=C["dim"],
-            anchor="w", justify="left", wraplength=400,
-        ).grid(row=5, column=0, columnspan=2, padx=14, pady=(0, 6), sticky="ew")
+        # Initialise canvas with default 2-speaker layout
+        self._on_ms_layout_preset("2.0 Stereo")
 
         # --- CHANNEL ROUTING -------------------------------------------------
         self._build_section("CHANNEL ROUTING", pad, parent=ms)
@@ -1346,6 +1427,435 @@ class ModAudioApp(ctk.CTk):
         # Apply initial mode state (loopback default: no capture dropdown)
         self._on_ms_mode_change("Loopback")
         self._update_ms_bt_labels()
+
+    # =======================================================================
+    # Room canvas event handlers
+    # =======================================================================
+
+    def _on_ms_speaker_moved(self, sid: int, azimuth_deg: float, distance_m: float):
+        """Called by Room3DCanvas when a speaker is dragged to a new position."""
+        for spk in self._ms_speakers:
+            if spk["sid"] == sid:
+                # Sync elevation from canvas (canvas is authoritative for 3D position)
+                if self._room_canvas:
+                    az, el, dist = self._room_canvas.get_speaker_spherical(sid)
+                    spk["azimuth"]   = az
+                    spk["elevation"] = el
+                    spk["distance"]  = dist
+                else:
+                    spk["azimuth"]  = azimuth_deg
+                    spk["distance"] = distance_m
+                break
+        # Hot-update VBAP matrix if stream is running
+        if self._ms_running and self._ms_stream:
+            self._ms_hot_update_speakers()
+
+    def _on_ms_speaker_selected(self, sid: int):
+        """Called by Room3DCanvas when a speaker dot is clicked."""
+        self._ms_selected_sid = sid
+        spk = next((s for s in self._ms_speakers if s["sid"] == sid), None)
+        if spk is None:
+            return
+        az   = spk.get("azimuth",   0.0)
+        el   = spk.get("elevation", 0.0)
+        dist = spk.get("distance",  2.0)
+        # Update panel title
+        self._ms_spk_title.configure(
+            text=f"Speaker: {spk['label']}  "
+                 f"(az {az:.0f}°  el {el:.0f}°  "
+                 f"dist {dist:.1f} m)",
+            text_color=C["text"],
+        )
+        # Select device in dropdown
+        dev_lbl = spk.get("device_label", "Unassigned")
+        names = [l for _, l in self._all_out_list]
+        if dev_lbl in names:
+            self._ms_spk_dev_menu.set(dev_lbl)
+        else:
+            self._ms_spk_dev_menu.set(names[0] if names else "No devices")
+        # Sync facing sliders
+        face_az = spk.get("face_az", 0.0)
+        face_el = spk.get("face_el", 0.0)
+        if hasattr(self, "_ms_face_az_slider"):
+            self._ms_face_az_slider.set(face_az)
+            self._ms_lbl_face_az.configure(text=f"{face_az:.0f}°")
+        if hasattr(self, "_ms_face_el_slider"):
+            self._ms_face_el_slider.set(face_el)
+            self._ms_lbl_face_el.configure(text=f"{face_el:.0f}°")
+
+    def _on_ms_canvas_change(self):
+        """Called by Room3DCanvas on any structural change (add/remove speaker)."""
+        if self._room_canvas is None:
+            return
+        canvas_spks = self._room_canvas.get_speakers()
+        # Merge positions — canvas is source of truth for all 3D position/orientation
+        for cs in canvas_spks:
+            az, el, dist = self._room_canvas.get_speaker_spherical(cs.sid)
+            found = next((s for s in self._ms_speakers if s["sid"] == cs.sid), None)
+            if found:
+                found["azimuth"]      = az
+                found["elevation"]    = el
+                found["distance"]     = dist
+                found["label"]        = cs.label
+                found["device_idx"]   = cs.device_idx
+                found["device_label"] = cs.device_label
+                found["face_az"]      = cs.face_az
+                found["face_el"]      = cs.face_el
+            else:
+                self._ms_speakers.append({
+                    "sid":          cs.sid,
+                    "label":        cs.label,
+                    "azimuth":      az,
+                    "elevation":    el,
+                    "distance":     dist,
+                    "device_idx":   cs.device_idx,
+                    "device_label": cs.device_label,
+                    "face_az":      cs.face_az,
+                    "face_el":      cs.face_el,
+                })
+        # Remove speakers that no longer exist in canvas
+        canvas_sids = {cs.sid for cs in canvas_spks}
+        self._ms_speakers = [s for s in self._ms_speakers
+                              if s["sid"] in canvas_sids]
+
+    def _on_ms_layout_preset(self, layout_name: str):
+        """Load a speaker layout preset into the room canvas."""
+        if self._room_canvas is None:
+            return
+        self._ms_speakers.clear()
+        self._room_canvas.clear_speakers()
+
+        layout = SPEAKER_LAYOUTS_3D.get(layout_name, [])
+        for label, az, el, dist in layout:
+            # Auto-assign speakers based on their direction
+            device_idx   = None
+            device_label = "Unassigned"
+            is_front = label in ("FL", "FR", "C", "FL/FR")
+            is_rear  = label in ("SL", "SR", "BL", "BR", "RL", "RR")
+            # Use the first matching output row device
+            for row in self._ms_output_rows:
+                d = row.get("direction", "")
+                if is_front and "Front" in d and row.get("dev_idx") is not None:
+                    device_idx   = row["dev_idx"]
+                    device_label = row["dev_name"][:20]
+                    break
+                if is_rear and ("Rear" in d or "Surround" in d) and row.get("dev_idx") is not None:
+                    device_idx   = row["dev_idx"]
+                    device_label = row["dev_name"][:20]
+                    break
+
+            sid = self._room_canvas.add_speaker(
+                label, az, el, dist,
+                device_idx=device_idx,
+                device_label=device_label,
+            )
+            self._ms_speakers.append({
+                "sid":          sid,
+                "label":        label,
+                "azimuth":      az,
+                "elevation":    el,
+                "distance":     dist,
+                "device_idx":   device_idx,
+                "device_label": device_label,
+                "face_az":      (az + 180.0) % 360.0,
+                "face_el":      -el,
+            })
+        # Initialise per-speaker smoothing buffers
+        self._ms_dsp_per_spk = {s["sid"]: np.zeros(2, dtype=np.float32)
+                                 for s in self._ms_speakers}
+        self._ms_spk_title.configure(
+            text="No speaker selected", text_color=C["dim"])
+
+    def _on_ms_add_speaker(self):
+        """Add a new speaker at a default position."""
+        if self._room_canvas is None:
+            return
+        n   = len(self._ms_speakers)
+        az  = (n * 45.0) % 360.0   # spread around room
+        el  = 0.0
+        lbl = f"S{n + 1}"
+        sid = self._room_canvas.add_speaker(lbl, az, el, 2.5)
+        self._ms_speakers.append({
+            "sid": sid, "label": lbl,
+            "azimuth": az, "elevation": el, "distance": 2.5,
+            "device_idx": None, "device_label": "Unassigned",
+            "face_az": (az + 180.0) % 360.0, "face_el": 0.0,
+        })
+        self._ms_dsp_per_spk[sid] = np.zeros(2, dtype=np.float32)
+        # Select the new speaker
+        self._room_canvas.set_selected_sid(sid)
+        self._on_ms_speaker_selected(sid)
+
+    def _on_ms_remove_speaker(self):
+        """Remove the currently selected speaker."""
+        sid = self._ms_selected_sid
+        if sid is None or self._room_canvas is None:
+            return
+        self._room_canvas.remove_speaker(sid)
+        self._ms_speakers = [s for s in self._ms_speakers if s["sid"] != sid]
+        self._ms_dsp_per_spk.pop(sid, None)
+        self._ms_selected_sid = None
+        self._ms_spk_title.configure(
+            text="No speaker selected", text_color=C["dim"])
+
+    def _on_ms_spk_dev_change(self, display_name: str):
+        """Assign a device to the selected speaker."""
+        sid = self._ms_selected_sid
+        if sid is None:
+            return
+        for dev_idx, dev_label in self._all_out_list:
+            if dev_label == display_name:
+                # Update canvas
+                if self._room_canvas:
+                    self._room_canvas.set_speaker_device(
+                        sid, dev_idx, dev_label[:20])
+                # Update state
+                for spk in self._ms_speakers:
+                    if spk["sid"] == sid:
+                        spk["device_idx"]   = dev_idx
+                        spk["device_label"] = dev_label[:20]
+                        break
+                break
+
+    def _on_ms_room_dim_change(self):
+        """Room dimension entries changed."""
+        try:
+            w = float(self._ms_room_w_entry.get())
+            d = float(self._ms_room_d_entry.get())
+            h = float(self._ms_room_h_entry.get()) if hasattr(self, "_ms_room_h_entry") else self._ms_room_h
+            if w > 0 and d > 0 and h > 0:
+                self._ms_room_w = w
+                self._ms_room_d = d
+                self._ms_room_h = h
+                if self._room_canvas:
+                    self._room_canvas.set_room_size(w, d, h)
+        except ValueError:
+            pass
+
+    # -----------------------------------------------------------------------
+    # New 3D canvas / rotation / output-row handlers
+    # -----------------------------------------------------------------------
+
+    def _on_ms_speaker_rotated(self, sid: int, face_az: float, face_el: float):
+        """Called by Room3DCanvas when a speaker's facing direction changes."""
+        for spk in self._ms_speakers:
+            if spk["sid"] == sid:
+                spk["face_az"] = face_az
+                spk["face_el"] = face_el
+                break
+        if self._ms_selected_sid == sid:
+            if hasattr(self, "_ms_face_az_slider"):
+                self._ms_face_az_slider.set(face_az)
+                self._ms_lbl_face_az.configure(text=f"{face_az:.0f}°")
+            if hasattr(self, "_ms_face_el_slider"):
+                self._ms_face_el_slider.set(face_el)
+                self._ms_lbl_face_el.configure(text=f"{face_el:.0f}°")
+        # Hot-update routing matrix — facing direction affects L/R driver positions
+        if self._ms_running and self._ms_stream:
+            self._ms_hot_update_speakers()
+
+    def _ms_hot_update_speakers(self):
+        """Push current speaker positions and orientations to the running DSP chain."""
+        if not self._ms_running or not self._ms_stream:
+            return
+        azimuths   = [s["azimuth"]                              for s in self._ms_speakers]
+        elevations = [s.get("elevation", 0.0)                   for s in self._ms_speakers]
+        face_azs   = [s.get("face_az", (s["azimuth"]+180.0)%360.0) for s in self._ms_speakers]
+        face_els   = [s.get("face_el", 0.0)                     for s in self._ms_speakers]
+
+        if hasattr(self._ms_stream, "update_speakers"):
+            self._ms_stream.update_speakers(azimuths, elevations, face_azs, face_els)
+        elif hasattr(self._ms_stream, "update_speaker_azimuths"):
+            self._ms_stream.update_speaker_azimuths(azimuths)
+        elif hasattr(self._ms_stream, "update_rear_az") and len(azimuths) >= 2:
+            # Legacy 2-speaker path — also update full speaker info if available
+            stream = self._ms_stream
+            if hasattr(stream, "_chain") and hasattr(stream._chain, "update_speaker_info"):
+                n = len(self._ms_speakers)
+                f  = self._ms_speakers[0] if n >= 1 else {}
+                r  = self._ms_speakers[1] if n >= 2 else {}
+                stream._chain.update_speaker_info(
+                    (f.get("azimuth", 0.0),    f.get("elevation", 0.0),
+                     f.get("face_az", 180.0),   f.get("face_el",   0.0)),
+                    (r.get("azimuth", 150.0),  r.get("elevation", 0.0),
+                     r.get("face_az",   0.0),   r.get("face_el",   0.0)),
+                )
+            else:
+                stream.update_rear_az(max(60.0, min(170.0, abs(azimuths[1]))))
+
+    def _on_ms_face_slider_change(self, _value=None):
+        """Facing azimuth/elevation sliders changed."""
+        sid = self._ms_selected_sid
+        if sid is None or self._room_canvas is None:
+            return
+        face_az = self._ms_face_az_slider.get()
+        face_el = self._ms_face_el_slider.get()
+        self._ms_lbl_face_az.configure(text=f"{face_az:.0f}°")
+        self._ms_lbl_face_el.configure(text=f"{face_el:.0f}°")
+        self._room_canvas.set_speaker_facing(sid, face_az, face_el)
+        for spk in self._ms_speakers:
+            if spk["sid"] == sid:
+                spk["face_az"] = face_az
+                spk["face_el"] = face_el
+                break
+        # Hot-update routing matrix — facing direction changes L/R driver positions
+        if self._ms_running and self._ms_stream:
+            self._ms_hot_update_speakers()
+
+    def _ms_add_output_row(self, device_name: str = "", direction: str = "Front L/R"):
+        """Add a dynamic output device row to the OUTPUT DEVICES panel."""
+        names_all = [label for _, label in self._all_out_list]
+        cur_name  = device_name if device_name in names_all else (names_all[0] if names_all else "No devices")
+        dev_idx   = next((i for i, l in self._all_out_list if l == cur_name), None)
+
+        f_row = ctk.CTkFrame(self._ms_out_rows_frame, fg_color="transparent")
+        f_row.pack(fill="x", padx=0, pady=2)
+        f_row.grid_columnconfigure(0, weight=1)
+
+        dev_menu = ctk.CTkOptionMenu(
+            f_row,
+            values=names_all if names_all else ["No output devices"],
+            font=ctk.CTkFont(size=11),
+            fg_color=C["surface2"],
+            button_color=C["accent"], button_hover_color="#5a73f5",
+            dropdown_fg_color=C["surface2"], dropdown_hover_color=C["surface"],
+            corner_radius=7, height=30,
+        )
+        dev_menu.set(cur_name)
+        dev_menu.grid(row=0, column=0, padx=(0, 4), pady=0, sticky="ew")
+
+        dir_menu = ctk.CTkOptionMenu(
+            f_row,
+            values=CHANNEL_DIRECTIONS,
+            font=ctk.CTkFont(size=10),
+            fg_color=C["surface2"],
+            button_color=C["accent"], button_hover_color="#5a73f5",
+            dropdown_fg_color=C["surface2"], dropdown_hover_color=C["surface"],
+            corner_radius=7, height=30, width=148,
+        )
+        dir_menu.set(direction)
+        dir_menu.grid(row=0, column=1, padx=(0, 4), pady=0)
+
+        bass_btn = ctk.CTkButton(
+            f_row, text="Bass ♦",
+            font=ctk.CTkFont(size=10),
+            fg_color=C["surface2"], hover_color=C["surface"],
+            border_color=C["dim"], border_width=1,
+            text_color=C["dim"],
+            corner_radius=7, height=30, width=68,
+        )
+        bass_btn.grid(row=0, column=2, padx=(0, 4), pady=0)
+
+        del_btn = ctk.CTkButton(
+            f_row, text="×",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color=C["danger"], hover_color="#f56070",
+            text_color="white",
+            corner_radius=7, height=30, width=30,
+        )
+        del_btn.grid(row=0, column=3, pady=0)
+
+        row_data = {
+            "frame":     f_row,
+            "dev_menu":  dev_menu,
+            "dir_menu":  dir_menu,
+            "bass_btn":  bass_btn,
+            "del_btn":   del_btn,
+            "dev_idx":   dev_idx,
+            "dev_name":  cur_name,
+            "direction": direction,
+            "bass_active": False,
+        }
+        self._ms_output_rows.append(row_data)
+
+        # Wire callbacks (capture row_data by reference)
+        dev_menu.configure(command=lambda v, rd=row_data: self._on_ms_out_row_dev_change(rd, v))
+        dir_menu.configure(command=lambda v, rd=row_data: self._on_ms_out_row_dir_change(rd, v))
+        bass_btn.configure(command=lambda rd=row_data: self._on_ms_bass_priority_row(rd))
+        del_btn.configure(command=lambda rd=row_data: self._ms_remove_output_row(rd))
+
+        self._sync_front_rear_from_rows()
+
+    def _ms_remove_output_row(self, row_data: dict):
+        """Remove a dynamic output device row."""
+        if len(self._ms_output_rows) <= 1:
+            return   # keep at least one row
+        row_data["frame"].destroy()
+        self._ms_output_rows = [r for r in self._ms_output_rows if r is not row_data]
+        self._sync_front_rear_from_rows()
+
+    def _on_ms_out_row_dev_change(self, row_data: dict, display_name: str):
+        """Device dropdown changed in an output row."""
+        for dev_idx, dev_label in self._all_out_list:
+            if dev_label == display_name:
+                row_data["dev_idx"]  = dev_idx
+                row_data["dev_name"] = dev_label
+                break
+        self._sync_front_rear_from_rows()
+        self._update_ms_bt_labels()
+
+    def _on_ms_out_row_dir_change(self, row_data: dict, direction: str):
+        """Direction dropdown changed in an output row."""
+        row_data["direction"] = direction
+
+    def _on_ms_bass_priority_row(self, row_data: dict):
+        """Toggle bass priority for an output row."""
+        direction = row_data.get("direction", "")
+        side = "front" if "Front" in direction else "rear"
+        if self._ms_bass_priority == side:
+            self._ms_bass_priority = "equal"
+        else:
+            self._ms_bass_priority = side
+        # Update button appearances across all rows
+        for rd in self._ms_output_rows:
+            d    = rd.get("direction", "")
+            s    = "front" if "Front" in d else "rear"
+            active = (self._ms_bass_priority == s)
+            rd["bass_btn"].configure(
+                fg_color=C["accent"] if active else C["surface2"],
+                border_color=C["accent"] if active else C["dim"],
+                text_color="white" if active else C["dim"],
+            )
+        if self._ms_running and self._ms_stream:
+            if hasattr(self._ms_stream, "update_bass_priority"):
+                self._ms_stream.update_bass_priority(self._ms_bass_priority)
+
+    def _sync_front_rear_from_rows(self):
+        """Update _ms_front_idx/_ms_rear_idx from the first front/rear output rows."""
+        for rd in self._ms_output_rows:
+            d = rd.get("direction", "")
+            if "Front" in d and rd.get("dev_idx") is not None:
+                self._ms_front_idx = rd["dev_idx"]
+                break
+        for rd in self._ms_output_rows:
+            d = rd.get("direction", "")
+            if ("Rear" in d or "Surround" in d) and rd.get("dev_idx") is not None:
+                self._ms_rear_idx = rd["dev_idx"]
+                break
+
+    # =======================================================================
+    # Backward-compat stubs for handlers that referenced old slider widgets
+    # =======================================================================
+
+    def _on_ms_orient_change(self, value: str):
+        self._ms_swap_rear_lr = (value == "Faces Me")
+        if self._ms_swap_switch.get() != self._ms_swap_rear_lr:
+            if self._ms_swap_rear_lr:
+                self._ms_swap_switch.select()
+            else:
+                self._ms_swap_switch.deselect()
+        if self._ms_running and self._ms_stream:
+            if hasattr(self._ms_stream, "update_swap_rear_lr"):
+                self._ms_stream.update_swap_rear_lr(self._ms_swap_rear_lr)
+
+    def _on_ms_az_slider(self, value: float):
+        self._ms_rear_az_deg = float(value)
+        if self._ms_running and self._ms_stream:
+            if hasattr(self._ms_stream, "update_rear_az"):
+                self._ms_stream.update_rear_az(self._ms_rear_az_deg)
+
+    def _on_ms_spkd_slider(self, value: float):
+        self._ms_acoustic_delay = float(value)
 
     def _update_ms_bt_labels(self):
         """Refresh BT detection labels and compensation direction text."""
@@ -1889,7 +2399,7 @@ class ModAudioApp(ctk.CTk):
             text_color=C["danger"] if self._xruns > 0 else C["dim"],
         )
 
-        # Multi-speaker meters
+        # Multi-speaker meters + room canvas level feed
         if self._ms_running and self._ms_stream:
             raw_front = self._ms_stream.raw_out_front.copy()
             raw_rear  = self._ms_stream.raw_out_rear.copy()
@@ -1917,6 +2427,54 @@ class ModAudioApp(ctk.CTk):
                 text=f"Xruns: {self._ms_stream.xruns}",
                 text_color=C["danger"] if self._ms_stream.xruns > 0 else C["dim"],
             )
+
+            # Feed per-speaker stereo levels to room canvas for wave visualisation
+            if self._room_canvas and self._ms_speakers:
+                # N-speaker stream: raw_out is a list of [left_rms, right_rms]
+                if isinstance(getattr(self._ms_stream, "raw_out", None), list):
+                    raw_list = self._ms_stream.raw_out
+                    for i, spk in enumerate(self._ms_speakers):
+                        if i < len(raw_list) and len(raw_list[i]) >= 2:
+                            l_raw = float(raw_list[i][0])
+                            r_raw = float(raw_list[i][1])
+                        elif i < len(raw_list):
+                            l_raw = r_raw = float(np.mean(raw_list[i]))
+                        else:
+                            l_raw = r_raw = 0.0
+                        # Smooth L and R independently (buf[0]=L, buf[1]=R)
+                        buf = self._ms_dsp_per_spk.get(spk["sid"],
+                                                       np.zeros(2, np.float32))
+                        for ci, raw in enumerate((l_raw, r_raw)):
+                            buf[ci] = (ALPHA_ATK * buf[ci] + (1 - ALPHA_ATK) * raw
+                                       if raw > buf[ci]
+                                       else ALPHA_REL * buf[ci] + (1 - ALPHA_REL) * raw)
+                        self._ms_dsp_per_spk[spk["sid"]] = buf
+                        self._room_canvas.set_speaker_stereo_level(
+                            spk["sid"], float(buf[0]), float(buf[1]))
+                else:
+                    # Legacy 2-speaker: pass true per-channel L/R levels so the
+                    # 3D visualisation can show which side of each speaker is active.
+                    #
+                    # raw_out_front/rear are measured AFTER swap_rear_lr, so:
+                    #   _ms_dsp_front[0] = front bus ch0 = left-side content
+                    #   _ms_dsp_front[1] = front bus ch1 = right-side content
+                    #   _ms_dsp_rear[0]  = rear bus ch0  = right-side content
+                    #                      (swap put rear_R here → listener's right)
+                    #   _ms_dsp_rear[1]  = rear bus ch1  = left-side content
+                    #                      (swap put rear_L here → listener's left)
+                    for i, spk in enumerate(self._ms_speakers):
+                        if i == 0:
+                            self._room_canvas.set_speaker_stereo_level(
+                                spk["sid"],
+                                float(self._ms_dsp_front[0]),
+                                float(self._ms_dsp_front[1]))
+                        else:
+                            # Rear speaker: ch0=right-side, ch1=left-side
+                            # (levels match what each physical driver actually plays)
+                            self._room_canvas.set_speaker_stereo_level(
+                                spk["sid"],
+                                float(self._ms_dsp_rear[0]),
+                                float(self._ms_dsp_rear[1]))
 
         self.after(50, self._tick_meters)
 
@@ -2017,7 +2575,8 @@ class ModAudioApp(ctk.CTk):
 
         if self._ms_mode == "loopback":
             # Front device = loopback source; no separate capture device needed
-            self._ms_front_menu.configure(state="normal")
+            if hasattr(self, "_ms_front_menu"):
+                self._ms_front_menu.configure(state="normal")
             if hasattr(self, "_ms_cap_row_label"):
                 self._ms_cap_row_label.grid_remove()
             if hasattr(self, "_ms_cap_menu"):
@@ -2032,7 +2591,8 @@ class ModAudioApp(ctk.CTk):
                 self._ms_lbl_rear_route.configure(
                     text="Surround L/R + Rear L/R + sub-bass")
         else:  # "dual"
-            self._ms_front_menu.configure(state="normal")
+            if hasattr(self, "_ms_front_menu"):
+                self._ms_front_menu.configure(state="normal")
             if hasattr(self, "_ms_cap_row_label"):
                 self._ms_cap_row_label.grid()
             if hasattr(self, "_ms_cap_menu"):
@@ -2365,30 +2925,123 @@ class ModAudioApp(ctk.CTk):
             self._stop()
 
         preset = self._build_ms_preset()
-        try:
-            self._ms_stream = MultiDeviceStream(
-                in_dev=self._ms_in_idx,
-                front_dev=self._ms_front_idx,
-                rear_dev=self._ms_rear_idx,
-                fs=SAMPLE_RATE,
-                block_size=BLOCK_SIZE,
-                preset=preset,
-                bt_delay_ms=self._ms_bt_delay,
-                swap_rear_lr=self._ms_swap_rear_lr,
-                mode=self._ms_mode,
-                front_gain=self._ms_front_gain,
-                rear_gain=self._ms_rear_gain,
-                bass_priority=self._ms_bass_priority,
-                rear_az_deg=self._ms_rear_az_deg,
-                acoustic_delay_ms=self._ms_acoustic_delay,
-            )
-            self._ms_stream.start()
-            self._ms_running = True
-            self._set_ms_running_ui(True)
-        except Exception as e:
-            self._ms_stream = None
-            self._show_error(
-                f"Could not start multi-speaker:\n{e}\n\nCheck device selection.")
+        n_spk  = len(self._ms_speakers)
+
+        # Determine whether to use N-speaker or legacy 2-speaker stream.
+        # The legacy MultiDeviceStream path handles 2-speaker setups correctly:
+        # it produces proper stereo L/R per bus via the 4-channel VBAP and
+        # applies swap_rear_lr to account for a rear speaker that faces the listener.
+        # The N-speaker path collapses each speaker to mono (correct for 3+
+        # individual mono speakers, wrong for a single stereo 2-speaker setup).
+        use_n_speaker = (n_spk > 2)
+
+        if use_n_speaker:
+            # ---- N-speaker mode (dual/Full Control only) ----------------
+            if self._ms_mode != "dual":
+                self._show_error(
+                    "3 or more speakers require Full Control mode.\n"
+                    "Please switch to 'Full Control' and set up a virtual "
+                    "audio cable (VB-Cable / ModAudio Surround) as your "
+                    "system output."
+                )
+                return
+
+            assigned = [s for s in self._ms_speakers if s["device_idx"] is not None]
+            speaker_devs = [s["device_idx"] for s in assigned]
+            azimuths     = [s["azimuth"]                         for s in assigned]
+            elevations   = [s.get("elevation", 0.0)              for s in assigned]
+            face_azs     = [s.get("face_az", (s["azimuth"]+180.0)%360.0) for s in assigned]
+            face_els     = [s.get("face_el", 0.0)                for s in assigned]
+
+            if not speaker_devs:
+                self._show_error(
+                    "No output devices assigned to speakers.\n"
+                    "Select a speaker dot in the room map and assign a device.")
+                return
+
+            gains = ([self._ms_front_gain]
+                     + [self._ms_rear_gain] * (len(speaker_devs) - 1))
+            try:
+                self._ms_stream = MultiSpeakerStreamN(
+                    in_dev=self._ms_in_idx,
+                    speaker_devs=speaker_devs,
+                    speaker_azimuths=azimuths,
+                    speaker_elevations=elevations,
+                    speaker_face_azs=face_azs,
+                    speaker_face_els=face_els,
+                    fs=SAMPLE_RATE,
+                    block_size=BLOCK_SIZE,
+                    preset=preset,
+                    bt_delay_ms=self._ms_bt_delay,
+                    gains=gains,
+                    bass_priority=self._ms_bass_priority,
+                )
+                self._ms_stream.start()
+                self._ms_running = True
+                self._set_ms_running_ui(True)
+                if self._room_canvas:
+                    self._room_canvas.start_animation()
+            except Exception as e:
+                self._ms_stream = None
+                self._show_error(
+                    f"Could not start N-speaker stream:\n{e}\n\n"
+                    "Check device assignments and ensure all devices are available.")
+
+        else:
+            # ---- Legacy 2-speaker stream (loopback or dual) -------------
+            # Derive front/rear device from speaker list if possible
+            front_dev = self._ms_front_idx
+            rear_dev  = self._ms_rear_idx
+            rear_az   = self._ms_rear_az_deg
+
+            # Build full speaker-info tuples so the routing matrix uses
+            # actual positions and facing directions (not hardcoded ±30°).
+            def _spk_info(spk_dict, default_az, default_face_az):
+                az    = float(spk_dict.get("azimuth",   default_az))
+                el    = float(spk_dict.get("elevation", 0.0))
+                faz   = float(spk_dict.get("face_az",   default_face_az))
+                fel   = float(spk_dict.get("face_el",   0.0))
+                return (az, el, faz, fel)
+
+            front_info = None
+            rear_info  = None
+            if n_spk >= 1 and self._ms_speakers[0]["device_idx"] is not None:
+                front_dev  = self._ms_speakers[0]["device_idx"]
+                front_info = _spk_info(self._ms_speakers[0], 0.0,   180.0)
+            if n_spk >= 2 and self._ms_speakers[1]["device_idx"] is not None:
+                rear_dev   = self._ms_speakers[1]["device_idx"]
+                rear_az    = abs(self._ms_speakers[1]["azimuth"])
+                rear_az    = max(60.0, min(170.0, rear_az))
+                rear_info  = _spk_info(self._ms_speakers[1], rear_az, (rear_az+180.0)%360.0)
+
+            try:
+                self._ms_stream = MultiDeviceStream(
+                    in_dev=self._ms_in_idx,
+                    front_dev=front_dev,
+                    rear_dev=rear_dev,
+                    fs=SAMPLE_RATE,
+                    block_size=BLOCK_SIZE,
+                    preset=preset,
+                    bt_delay_ms=self._ms_bt_delay,
+                    swap_rear_lr=self._ms_swap_rear_lr,
+                    mode=self._ms_mode,
+                    front_gain=self._ms_front_gain,
+                    rear_gain=self._ms_rear_gain,
+                    bass_priority=self._ms_bass_priority,
+                    rear_az_deg=rear_az,
+                    acoustic_delay_ms=self._ms_acoustic_delay,
+                    front_info=front_info,
+                    rear_info=rear_info,
+                )
+                self._ms_stream.start()
+                self._ms_running = True
+                self._set_ms_running_ui(True)
+                if self._room_canvas:
+                    self._room_canvas.start_animation()
+            except Exception as e:
+                self._ms_stream = None
+                self._show_error(
+                    f"Could not start multi-speaker:\n{e}\n\nCheck device selection.")
 
     def _stop_multi(self):
         self._ms_running = False
@@ -2397,6 +3050,8 @@ class ModAudioApp(ctk.CTk):
             self._ms_stream = None
         self._ms_dsp_front[:] = 0
         self._ms_dsp_rear[:]  = 0
+        if self._room_canvas:
+            self._room_canvas.stop_animation()
         self._set_ms_running_ui(False)
 
     def _set_ms_running_ui(self, running: bool):

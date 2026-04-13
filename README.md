@@ -18,15 +18,18 @@ Transform your audio playback into an immersive theater experience with **ModAud
 - Customizable reverb, width, bass, and dynamics
 - 4 theater presets (Cinema, IMAX, Dolby, Home)
 
-#### Multi-Speaker Mode (Two Physical Speakers)
-- **VB-Cable integration** — automatically captures audio to route through both speakers
-- **VBAP routing** (Vector Base Amplitude Panning) maps 7 virtual surround channels to 2 physical speakers
+#### Multi-Speaker Mode (2 or More Physical Speakers)
+- **VB-Cable integration** — automatically captures audio to route through multiple speakers
+- **2-speaker mode** — full 4-channel VBAP (front-L/R, rear-L/R) with swap-rear-LR for correct spatial mapping
+- **N-speaker mode (3+)** — add any number of speakers via the "Add Speaker" button; each gets independent device assignment and DSP
+- **VBAP routing** (Vector Base Amplitude Panning) maps 7 virtual surround channels to your physical speakers
+- **3D great-circle VBAP** — true spherical VBAP that correctly routes to height speakers (Dolby Atmos) in addition to horizontal layouts
 - **True surround sound** that moves around your listening position (front → side → rear → side → front)
 - **Customizable rear speaker placement** — adjust azimuth angle (90°–170°) to match your room layout
 - **Speaker orientation awareness** — "Faces Me" or "Faces Away" settings adapt surround routing to your setup
 - **Acoustic delay calibration** — time-align speakers for coherent wavefront merging
-- **3D spatial modeling** — simulates how two speakers interact to create a sound field that envelops you
-- **Behind spectral coloring** — psychoacoustic processing helps you localize the rear speaker as coming from behind
+- **Behind spectral coloring** — psychoacoustic processing helps you localize rear speakers as coming from behind
+- **3D Room Visualization** — interactive 3D room canvas for speaker placement, device assignment, and real-time sound wave animation
 
 ### 🎚️ Theater Presets
 - **Cinema** — Standard commercial cinema sound (RT60 1.3s, 6 dB bass boost)
@@ -64,8 +67,9 @@ Transform your audio playback into an immersive theater experience with **ModAud
 
 ### Optional: Multi-Speaker Support
 - **Virtual audio loopback device** (platform-dependent; see "Virtual Audio Solutions" below)
-- Two physical speakers positioned in your listening environment
+- Two or more physical speakers positioned in your listening environment
 - Audio interface or multi-channel capable soundcard (optional, for separate speaker routing)
+- For N-speaker mode (3+): one audio output device per speaker (USB interfaces, multi-channel soundcards, or virtual cables)
 
 ---
 
@@ -220,10 +224,11 @@ To route audio through two independent speakers, you need a **virtual audio loop
    - **Install** and restart your computer
    - VB-Cable will appear as a playback device in Windows Sound settings
 
-2. **Two physical speakers** placed in your room:
+2. **Two or more physical speakers** placed in your room:
    - **Front speaker** — facing your listening position (typical setup)
    - **Rear speaker** — positioned behind or to the side of your listening area
    - Any speaker type (bookshelf, studio monitors, powered, passive, etc.)
+   - **For 3+ speakers:** each additional speaker needs its own audio output device (USB interface, virtual cable, etc.)
 
 ### Connecting Speakers
 
@@ -245,7 +250,8 @@ To route audio through two independent speakers, you need a **virtual audio loop
    - **IMAX** — overwhelming scale, 10 dB bass boost, massive reverb (RT60 1.9s)
    - **Dolby** — precision sound, tight room, excellent dialog (RT60 0.95s)
    - **Home** — subtle enhancement for residential listening
-3. **SPEAKER PLACEMENT** — Configure your setup:
+3. **Add speakers if needed** — click **"Add Speaker"** to add a third, fourth, or more speakers. Each must be assigned to its own audio output device.
+4. **SPEAKER PLACEMENT** — Configure your setup (2-speaker mode):
    - **Orientation** — Select "Faces Me" (both speakers point toward you) or "Faces Away" (rear faces away)
      - *Different orientations change surround routing to match speaker direction*
    - **Rear Position** — Azimuth slider (90°–170°)
@@ -257,11 +263,15 @@ To route audio through two independent speakers, you need a **virtual audio loop
      - *Compensates for physical distance between front and rear speakers*
      - Use ~3 ms per meter of distance
 
-4. **DEVICE SETUP** — Choose audio devices:
+5. **For N-speaker mode (3+):** Use the **3D View** tab to drag each speaker to its physical position, set its facing direction, and assign its audio device. See "3D Room Visualization" for full controls.
+
+   > **All speakers must be assigned to audio devices before clicking "Start" — unassigned speakers produce no audio.**
+
+6. **DEVICE SETUP** — Choose audio devices:
    - **Front Speaker** — your primary playback device
    - **Rear Speaker** — VB-Cable or second audio output
 
-5. **Click "Start"** — ProcessIng begins on both buses simultaneously
+7. **Click "Start"** — Processing begins on all buses simultaneously
 
 ### Multi-Speaker Audio Flow
 
@@ -298,6 +308,138 @@ Transient Enhancement → Master Gain →
 | RB (+150°, right back) | 0% | 0% | 0% | 100% |
 
 **Result:** When surround audio pans around you (right → rear → left), VBAP smoothly transitions power between front and rear speakers, creating a "wrap-around head" effect. With rear speaker orientation awareness, these mappings adapt to match whether your rear speaker faces you or faces away.
+
+---
+
+## N-Speaker Mode (3 or More Speakers)
+
+ModAudio supports **any number of physical speakers** — not just two. Click the **"Add Speaker"** button in the Multi-Speaker tab to add a third, fourth, or more speakers. Each additional speaker gets its own audio device assignment, azimuth, elevation, and facing direction.
+
+### Adding Speakers
+
+1. **Switch to the "Multi-Speaker" tab**
+2. Click **"Add Speaker"** at the top of the controls panel — a new speaker entry appears
+3. **Assign each speaker** to a physical audio device via its device dropdown
+   - Every speaker must be assigned to a device before audio will route to it
+4. **Configure speaker positions** (azimuth, elevation) and facing direction in the 3D view (see "3D Room Visualization" below)
+5. **Click "Start"** when all speakers are assigned and positioned
+
+### How N-Speaker Routing Works
+
+With 3 or more speakers, ModAudio uses **MultiSpeakerStreamN** — a dedicated audio engine for multi-point speaker arrays. It applies a **two-step VBAP routing** algorithm:
+
+**Step 1 — Speaker selection (3D great-circle VBAP):**
+- For each of the 7 virtual surround channels, the two speakers with the smallest angular distance (measured as great-circle arc on a sphere) are found.
+- This uses true 3D geometry — height speakers (e.g. Dolby Atmos ceiling channels) are handled correctly and only receive signal from virtual channels that are genuinely close to them in 3D space.
+- Gain is distributed between the two closest speakers using constant-power panning.
+
+**Step 2 — Per-speaker L/R driver pan:**
+- Within each winning speaker, audio is panned between the speaker's physical left and right driver positions using signed-difference angular panning.
+- This avoids VBAP degeneracy that occurs with inward-facing 5.1/7.1 layouts where adjacent speakers' driver positions overlap.
+
+Each speaker in N-speaker mode independently receives:
+- Mid/high content from its VBAP gain allocation
+- Sub-bass mixed in from the global LFE bus
+- Spectral coloring (behind-filter) if positioned behind the listener
+- Independent peak limiting to prevent clipping
+
+### Theater Presets in N-Speaker Mode
+
+All four presets (Cinema, IMAX, Dolby, Home) are fully supported in N-speaker mode. You can switch presets at any time — even while audio is playing — by clicking the preset button. The DSP chain rebuilds instantly with all speaker positions preserved.
+
+### Multi-Speaker Audio Flow (N Speakers)
+
+```
+Input Audio → Bass Enhancement → EQ → Reverb → Dynamics →
+Transient Enhancement → Master Gain →
+     ↓ (split into sub-bass and mid/high)
+     ├─ SUB-BASS: mixed into each speaker bus with priority weighting
+     └─ MID/HIGH: 7-channel adaptive upmix →
+          FL, FR, C, LS, RS, LB, RB →
+          Two-step VBAP (3D great-circle + per-speaker L/R pan) →
+          Speaker 1 bus … Speaker N bus →
+               ↓ (per bus)
+          Spectral coloring (if rear/side facing)
+               ↓
+          Per-bus peak limiting
+               ↓
+          Output to assigned device
+```
+
+---
+
+## 3D Room Visualization
+
+The **3D Room View** tab provides a real-time three-dimensional visualization of your speaker layout, your virtual room, and the sound waves generated by each speaker. It is not just decorative — it is also the **primary interface for assigning speakers to audio devices and positioning them accurately in 3D space**.
+
+> **⚠ IMPORTANT: Speakers MUST be assigned to audio devices in the 3D view before audio will route to them.** A speaker that appears in the 3D view but has no device assigned will produce no audio output, even if the system is running. Always verify that every speaker has a device selected before clicking "Start".
+
+### Opening the 3D View
+
+Click the **"3D View"** tab inside the Multi-Speaker tab to open the 3D room canvas.
+
+### Camera Controls
+
+The 3D room canvas supports full interactive camera control with mouse:
+
+| Action | Effect |
+|---|---|
+| **Left-click + drag** | Orbit the camera — rotate viewpoint around the room |
+| **Scroll wheel** | Zoom in / zoom out |
+| **Shift + left-click + drag** | Raise or lower a speaker's height (elevation in the vertical axis) |
+| **Right-click on a speaker** | Rotate the speaker's facing direction |
+
+### Scaling the Room to Your Real Space
+
+The 3D view renders speakers inside a virtual room that you can scale to match your **actual physical room dimensions**. By default the room is set to a generic 5 × 4 × 2.5 m space.
+
+| Setting | What it controls |
+|---|---|
+| **Room Width** (`room_width_m`) | Left-to-right dimension of your listening space (metres) |
+| **Room Depth** (`room_depth_m`) | Front-to-back dimension (metres) |
+| **Room Height** (`room_height_m`) | Ceiling height (metres) |
+
+Setting accurate room dimensions means the speaker positions in the 3D view correspond 1-to-1 with real physical positions. Sound wave propagation distances and wall-reflection angles are calculated from these measurements, so the visualization reflects what is actually happening in your room.
+
+### Placing Speakers
+
+1. **Drag speakers** to their physical positions in the 3D room (left-click + drag a speaker icon)
+2. **Rotate their facing direction** (right-click + drag on the speaker) to match how each physical speaker is pointed — front speakers typically face toward you, rear speakers may face you or away
+3. **Adjust height** with Shift + drag if your speakers are at different elevations (e.g. floor-level subwoofers vs. ceiling-mounted Atmos height speakers)
+4. **Assign each speaker to an audio device** by clicking the speaker and choosing its output device from the assignment panel
+
+> Speakers without a device assignment will be visible in the 3D view but will not produce any audio. Make sure every speaker is assigned before starting playback.
+
+The DSP routing (VBAP gains, behind-filter, L/R driver positions) is **automatically recomputed** whenever you move a speaker or change its facing direction, so the audio routing always stays in sync with what you see in the 3D view.
+
+### Sound Wave Visualization
+
+The 3D view animates the actual sound waves being emitted by each speaker in real time. Rather than simple expanding spheres, the waves are rendered as **directional ray beams** that trace the accurate propagation path from each speaker — including a single wall reflection — through your virtual room.
+
+#### How Rays Are Generated
+
+Each audio tick, a burst of rays ("pulse") is fired from the speaker. The ray cluster is centred on the speaker's facing axis and spread across a 72° emission cone. Rays travel at 343 m/s (scaled to the room) and fade out at approximately 7.5 m. Each ray is pre-traced — direct path plus one wall-bounce reflection — so the visualization has no per-frame physics cost.
+
+**Left-channel rays** originate from the speaker's left driver position (~11 cm left of the speaker centre). **Right-channel rays** originate from the right driver position (~11 cm right). When audio pans left-to-right, the visible ray origin visibly shifts from the left driver to the right driver.
+
+#### Pan Direction Tracking
+
+When the audio through a speaker is louder on one channel than the other (e.g. a sound effect panning from left to right), the **emission cone shifts** up to 28° toward the active channel. A fully right-panned source shifts the cone 28° along the speaker's right axis, causing the ray cluster to sweep across the speaker face as the audio moves. This lets you visually follow a moving sound source (a car driving off-screen, a bird flying past) in the 3D view.
+
+#### Spike vs. Ambient Intensity
+
+The visualization uses a **slow-tracking ambient floor** (exponential moving average with ~1 second half-life) to separate transient spikes from steady background:
+
+| Visual appearance | Meaning |
+|---|---|
+| **Thin, dim rays** | Ambient background level — steady music, room tone, nature sounds |
+| **Thick, bright rays (up to 3× width)** | Transient spike — a sudden sound exceeding 1.4× the ambient floor |
+
+This makes it easy to identify dynamic events (a bird flapping, an explosion, a door slam) even when a constant ambient noise floor is present. In a nature scene with birds: the **thin rays** represent the ambient nature sounds; the **bright, thick rays** fire when a bird makes a sudden movement or call.
+
+#### Ambient Halo
+
+Each speaker also displays a **soft ambient halo** — a translucent oval that expands proportionally to the speaker's average output level. Even when no spike is occurring, the halo indicates whether a speaker is loud or quiet at a glance. Larger halo = more ambient output. This is especially useful for multi-speaker setups where some speakers may be carrying much more signal than others.
 
 ---
 
@@ -744,8 +886,10 @@ newgrp audio
 | **Bit Depth** | 32-bit float (internal processing) |
 | **Buffer Size** | 512 samples (~10.7 ms latency) |
 | **HRTF** | Brown-Duda (headphones mode) |
-| **Surround Channels** | 5.1 virtual (6 channels + LFE) |
-| **Physical Speakers** | 2-channel stereo (multi-speaker mode) |
+| **Surround Channels** | 7 virtual cinema channels (FL, FR, C, LS, RS, LB, RB) |
+| **Physical Speakers** | 2-channel stereo or N-speaker (2+, each independently routed) |
+| **VBAP Algorithm** | Two-step: 3D great-circle speaker selection + per-speaker L/R constant-power pan |
+| **3D Visualization** | Ray-traced directional sound waves, 1 wall reflection, spike/ambient separation |
 
 ---
 
@@ -801,10 +945,12 @@ ModAudio/
 ├── audio_io.py            # Device enumeration (cross-platform)
 ├── audio_multi.py         # Multi-speaker audio streaming (cross-platform)
 ├── virtual_device.py      # Virtual audio setup (cross-platform with platform-specific branches)
+├── room_canvas.py         # Interactive 2D top-down room map with speaker drag-and-drop
+├── room_canvas_3d.py      # Interactive 3D room visualization with ray-traced sound waves
 ├── dsp/
 │   ├── __init__.py
 │   ├── surround_engine.py # Adaptive 7.1 surround upmix
-│   ├── multi_speaker.py   # VBAP routing & multi-speaker DSP
+│   ├── multi_speaker.py   # VBAP routing & multi-speaker DSP (2-speaker and N-speaker)
 │   ├── filters.py         # IIR filter implementations
 │   ├── equalizer.py       # Cinema EQ (X-curve + bass)
 │   ├── reverb.py          # FDN reverb + early reflections

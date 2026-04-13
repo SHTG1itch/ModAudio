@@ -370,6 +370,8 @@ class MultiDeviceStream:
         bass_priority: str = "equal",
         rear_az_deg: float = 150.0,
         acoustic_delay_ms: float = 0.0,
+        front_info: tuple | None = None,
+        rear_info:  tuple | None = None,
     ):
         self._in_dev    = in_dev
         self._front_dev = front_dev
@@ -380,7 +382,9 @@ class MultiDeviceStream:
 
         self._chain = MultiSpeakerChain(fs=fs, preset=preset,
                                         bass_priority=bass_priority,
-                                        rear_az_deg=rear_az_deg)
+                                        rear_az_deg=rear_az_deg,
+                                        front_info=front_info,
+                                        rear_info=rear_info)
 
         # -- Bluetooth detection ------------------------------------------
         devs = sd.query_devices()
@@ -491,6 +495,10 @@ class MultiDeviceStream:
     def update_rear_az(self, rear_az_deg: float) -> None:
         """Update rear speaker azimuth and rebuild VBAP routing matrix."""
         self._chain.update_rear_az(rear_az_deg)
+
+    def update_speaker_info(self, front_info: tuple, rear_info: tuple) -> None:
+        """Update both speakers' position/orientation and rebuild routing matrix."""
+        self._chain.update_speaker_info(front_info, rear_info)
 
     @property
     def front_delay_ms(self) -> float:
@@ -913,6 +921,330 @@ class MultiDeviceStream:
         self._rear_ring.reset()
         self._front_delay_buf.reset()
         self._rear_delay_buf.reset()
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+
+# ---------------------------------------------------------------------------
+# N-speaker stream  (Full-Control / dual mode only)
+# ---------------------------------------------------------------------------
+
+class MultiSpeakerStreamN:
+    """
+    Routes captured audio to N physical speaker buses.
+
+    Architecture
+    ------------
+    Capture device  →  _in_ring  →  [_proc_thread]  →  _out_rings[0..N-1]
+                                                      ↓
+                                             N sounddevice OutputStreams
+
+    Each output stream drains its own ring buffer independently, so N
+    different devices (wired, Bluetooth, HDMI…) can be driven simultaneously
+    without clock synchronisation issues.
+
+    Only "dual" (Full Control) mode is supported: a virtual audio cable
+    (VB-Cable, ModAudio Surround, etc.) must be set as the system default
+    output so that all application audio is captured here.
+
+    Parameters
+    ----------
+    in_dev             : capture device index (VB-Cable / loopback source)
+    speaker_devs       : list of N output device indices, one per speaker
+    speaker_azimuths   : list of N azimuth angles in degrees
+    speaker_elevations : list of N elevation angles in degrees (optional, default 0)
+    speaker_face_azs   : list of N facing azimuths in degrees (optional,
+                         default: each speaker facing toward the listener)
+    speaker_face_els   : list of N facing elevations in degrees (optional, default 0)
+    fs                 : sample rate (Hz)
+    block_size         : audio block size (samples)
+    preset             : theater preset dict
+    bt_delay_ms        : global Bluetooth compensation (ms)
+    gains              : list of N per-speaker volume multipliers (default 1.0)
+    bass_priority      : "equal" | "front" | "rear"
+    """
+
+    def __init__(
+        self,
+        in_dev: int,
+        speaker_devs: list,
+        speaker_azimuths: list,
+        speaker_elevations: list | None = None,
+        speaker_face_azs:   list | None = None,
+        speaker_face_els:   list | None = None,
+        fs: int = 48000,
+        block_size: int = 512,
+        preset: dict | None = None,
+        bt_delay_ms: float = 150.0,
+        gains: list | None = None,
+        bass_priority: str = "equal",
+    ):
+        if len(speaker_devs) < 1:
+            raise ValueError("speaker_devs must have at least one device")
+        if len(speaker_azimuths) != len(speaker_devs):
+            raise ValueError("speaker_devs and speaker_azimuths must have the same length")
+
+        from dsp.multi_speaker import MultiSpeakerChainN
+        self._in_dev       = in_dev
+        self._speaker_devs = list(speaker_devs)
+        self._N            = len(speaker_devs)
+        self._fs           = fs
+        self._bs           = block_size
+
+        # Gains per speaker
+        if gains is None:
+            gains = [1.0] * self._N
+        self._gains = [float(g) for g in gains]
+
+        # DSP chain — pass full position+orientation info
+        self._chain = MultiSpeakerChainN(
+            fs=fs,
+            preset=preset,
+            speaker_azimuths=speaker_azimuths,
+            speaker_elevations=speaker_elevations,
+            speaker_face_azs=speaker_face_azs,
+            speaker_face_els=speaker_face_els,
+            bass_priority=bass_priority,
+        )
+
+        # Bluetooth delay — applied as a digital delay to the faster speakers
+        devs = sd.query_devices()
+        self._is_bt  = []
+        self._names  = []
+        for d in speaker_devs:
+            nm = devs[d]["name"] if d < len(devs) else ""
+            self._names.append(nm)
+            self._is_bt.append(is_bluetooth_device(nm))
+
+        max_d = int(round(500.0 * fs / 1000.0)) + block_size + 256
+        self._delay_bufs = [_DelayBuffer(max_d, channels=2)
+                            for _ in range(self._N)]
+        self._delay_samp = [0] * self._N
+        self._apply_bt_delay(bt_delay_ms)
+
+        # Ring buffers  (one per output device)
+        ring_frames = int(round(_RING_MS * fs / 1000.0))
+        self._in_ring   = _AudioRingBuffer(ring_frames, channels=2)
+        self._out_rings = [_AudioRingBuffer(ring_frames, channels=2)
+                           for _ in range(self._N)]
+
+        # Streams / threads
+        self._sd_in      = None
+        self._sd_outs    = [None] * self._N
+        self._proc_thread = None
+        self._running     = False
+        self._stop_event  = threading.Event()
+
+        # Metering  (backward-compat aliases + per-speaker list)
+        self.xruns          = 0
+        self.raw_in         = np.zeros(2, dtype=np.float32)
+        self.raw_out        = [np.zeros(2, dtype=np.float32)
+                               for _ in range(self._N)]
+        # Keep front/rear aliases for code that uses MultiDeviceStream API
+        self.raw_out_front  = self.raw_out[0]
+        self.raw_out_rear   = self.raw_out[min(1, self._N - 1)]
+
+    # ------------------------------------------------------------------ #
+    # Delay management
+    # ------------------------------------------------------------------ #
+
+    def _apply_bt_delay(self, bt_delay_ms: float) -> None:
+        samples = int(round(bt_delay_ms * self._fs / 1000.0))
+        # Delay all wired speakers to match the slowest Bluetooth speaker
+        any_bt = any(self._is_bt)
+        for i in range(self._N):
+            if any_bt and not self._is_bt[i]:
+                self._delay_samp[i] = samples
+            else:
+                self._delay_samp[i] = 0
+
+    def update_bt_delay(self, bt_delay_ms: float) -> None:
+        self._apply_bt_delay(bt_delay_ms)
+
+    def update_speakers(
+        self,
+        azimuths:   list,
+        elevations: list | None = None,
+        face_azs:   list | None = None,
+        face_els:   list | None = None,
+    ) -> None:
+        """Update speaker positions/orientations and rebuild VBAP routing matrix."""
+        self._chain.update_speakers(azimuths, elevations, face_azs, face_els)
+
+    def update_speaker_azimuths(self, azimuths: list) -> None:
+        """Backward-compatible alias — updates azimuths only."""
+        self._chain.update_speakers(azimuths)
+
+    def update_chain(self, preset: dict) -> None:
+        """Rebuild DSP chain with a new theater preset, preserving speaker layout."""
+        from dsp.multi_speaker import MultiSpeakerChainN
+        old = self._chain
+        azimuths   = list(old._azimuths)
+        spk_info   = list(old._speaker_info)   # [(az, el, face_az, face_el), ...]
+        elevations = [si[1] for si in spk_info]
+        face_azs   = [si[2] for si in spk_info]
+        face_els   = [si[3] for si in spk_info]
+        self._chain = MultiSpeakerChainN(
+            fs=self._fs,
+            preset=preset,
+            speaker_azimuths=azimuths,
+            speaker_elevations=elevations,
+            speaker_face_azs=face_azs,
+            speaker_face_els=face_els,
+            bass_priority=old._bass_priority,
+        )
+
+    def update_gains(self, gains: list) -> None:
+        self._gains = [float(g) for g in gains]
+
+    def update_bass_priority(self, priority: str) -> None:
+        self._chain.set_bass_priority(priority)
+
+    def update_front_gain(self, gain: float) -> None:
+        if self._gains:
+            self._gains[0] = float(gain)
+
+    def update_rear_gain(self, gain: float) -> None:
+        for i in range(1, len(self._gains)):
+            self._gains[i] = float(gain)
+
+    # ------------------------------------------------------------------ #
+    # Start / stop
+    # ------------------------------------------------------------------ #
+
+    def start(self) -> None:
+        self._stop_event.clear()
+
+        # ---- Capture stream (explicit input device) ----------------------
+        try:
+            in_info = sd.query_devices(self._in_dev, "input")
+            in_ch   = min(int(in_info["max_input_channels"]), 2)
+        except Exception:
+            in_ch = 2
+
+        def _in_cb(indata, frames, time_info, status):
+            if status:
+                self.xruns += 1
+            sq = indata * indata
+            self.raw_in = np.sqrt(np.array(
+                [sq[:, 0].mean(), sq[:, 1 if sq.shape[1] > 1 else 0].mean()],
+                dtype=np.float32,
+            ))
+            block = (indata[:, :2] if indata.shape[1] >= 2
+                     else np.column_stack([indata[:, 0]] * 2)).astype(np.float32)
+            self._in_ring.write(block)
+
+        self._sd_in = sd.InputStream(
+            samplerate=self._fs,
+            blocksize=self._bs,
+            device=self._in_dev,
+            channels=in_ch,
+            dtype="float32",
+            callback=_in_cb,
+            latency="low",
+        )
+        self._sd_in.start()
+
+        # ---- N output streams -------------------------------------------
+        for i in range(self._N):
+            dev  = self._speaker_devs[i]
+            ring = self._out_rings[i]
+            try:
+                info  = sd.query_devices(dev, "output")
+                out_ch = min(int(info["max_output_channels"]), 2)
+            except Exception:
+                out_ch = 2
+
+            def _make_out_cb(r, idx):
+                def _cb(outdata, frames, time_info, status):
+                    if status:
+                        self.xruns += 1
+                    data = r.read_nb(frames)
+                    if data is None:
+                        outdata[:] = 0.0
+                    else:
+                        n = min(len(data), len(outdata))
+                        outdata[:n] = data[:n]
+                        if n < len(outdata):
+                            outdata[n:] = 0.0
+                        sq = data * data
+                        self.raw_out[idx] = np.sqrt(np.array(
+                            [sq[:, 0].mean(), sq[:, 1].mean()],
+                            dtype=np.float32))
+                return _cb
+
+            out_sd = sd.OutputStream(
+                samplerate=self._fs,
+                blocksize=self._bs,
+                device=dev,
+                channels=out_ch,
+                dtype="float32",
+                callback=_make_out_cb(ring, i),
+                latency="low",
+            )
+            out_sd.start()
+            self._sd_outs[i] = out_sd
+
+        # ---- Processing thread ------------------------------------------
+        self._running     = True
+        self._proc_thread = threading.Thread(
+            target=self._proc_loop, daemon=True, name="ModAudio-ProcN")
+        self._proc_thread.start()
+
+    def _proc_loop(self) -> None:
+        while not self._stop_event.is_set():
+            block = self._in_ring.read(self._bs, timeout=_PROC_TIMEOUT)
+            if block is None:
+                continue
+            try:
+                buses = self._chain.process(block)
+            except Exception as exc:
+                print(f"[MultiSpeakerStreamN] DSP error: {exc}")
+                for ring in self._out_rings:
+                    ring.write(np.zeros((self._bs, 2), dtype=np.float32))
+                continue
+
+            for i, stereo in enumerate(buses):
+                gain = self._gains[i] if i < len(self._gains) else 1.0
+                stereo = stereo * gain
+                # Apply BT compensation delay
+                if self._delay_samp[i] > 0:
+                    stereo = self._delay_bufs[i].process(stereo, self._delay_samp[i])
+                self._out_rings[i].write(stereo)
+
+    def stop(self) -> None:
+        self._running = False
+        self._stop_event.set()
+
+        if self._proc_thread:
+            self._proc_thread.join(timeout=2.0)
+            self._proc_thread = None
+
+        if self._sd_in:
+            try:
+                self._sd_in.stop()
+                self._sd_in.close()
+            except Exception:
+                pass
+            self._sd_in = None
+
+        for i, out in enumerate(self._sd_outs):
+            if out is not None:
+                try:
+                    out.stop()
+                    out.close()
+                except Exception:
+                    pass
+                self._sd_outs[i] = None
+
+        # Reset all buffers
+        self._in_ring.reset()
+        for ring in self._out_rings:
+            ring.reset()
+        for buf in self._delay_bufs:
+            buf.reset()
 
     @property
     def running(self) -> bool:
