@@ -68,6 +68,9 @@ PRESETS = {
     },
     # Dolby: precision-tuned, tighter room, less aggressive dynamics.
     # Optimises for articulate surround localisation and clean dialog intelligibility.
+    # Atmos-style height rendering is enabled; if no physical height speaker is
+    # placed in the room canvas, height sends gracefully fall back to ground
+    # speakers via the same VBAP engine Dolby's own renderer uses.
     "Dolby": {
         "rt60": 0.95,  "rt60_hf": 0.50,
         "reverb_predelay_ms": 18.0,  "reverb_mix": 0.16,  "early_ref_mix": 0.34,
@@ -78,6 +81,7 @@ PRESETS = {
         "air_exciter_level": 0.12,
         "mb_compress_drive": 1.2,  "transient_amount": 0.38,
         "output_gain_db": 4.5,
+        "atmos_mode": True,   "height_level": 0.45,
     },
     "Home": {
         "rt60": 0.8,  "rt60_hf": 0.45,
@@ -100,17 +104,62 @@ SLIDERS = [
     ("Dynamics", "mb_compress_drive",1.0,  2.2, lambda v: f"{v:.1f}"),
 ]
 
-# Color palette
+# Color palette — Apple-inspired dark-mode system
 C = {
-    "accent":    "#4361ee",
-    "success":   "#06d6a0",
-    "danger":    "#ef476f",
-    "warn":      "#ffd166",
-    "surface":   "#1c2333",
-    "surface2":  "#161b27",
-    "dim":       "#6e7a8a",
-    "text":      "#e8edf3",
+    "accent":    "#0A84FF",  # system blue (dark mode)
+    "success":   "#30D158",  # system green
+    "danger":    "#FF453A",  # system red
+    "warn":      "#FFD60A",  # system yellow
+    "surface":   "#1C1C1E",  # systemGray6 dark
+    "surface2":  "#111113",  # deeper surface for window bg
+    "dim":       "#8E8E93",  # systemGray
+    "text":      "#F5F5F7",  # Apple-website near-white
 }
+
+# Corner radius — squircle-adjacent. tkinter can't render true squircles,
+# but larger radii read the same at a glance.
+RADIUS    = 16
+RADIUS_SM = 12
+RADIUS_LG = 20
+
+# Font stack. SF Pro isn't redistributable — we fall back through Inter,
+# Segoe UI Variable (Windows 11 default), Helvetica Neue, Arial.
+_APPLE_FONT_FAMILY = "SF Pro Display"
+_APPLE_FONT_FALLBACK = ("SF Pro Text", "Inter", "Segoe UI Variable",
+                        "Segoe UI", "Helvetica Neue", "Arial")
+
+def _pick_font_family():
+    """Pick the first installed font from the Apple stack."""
+    try:
+        import tkinter.font as _tkfont
+        installed = set(_tkfont.families())
+        for fam in (_APPLE_FONT_FAMILY, *_APPLE_FONT_FALLBACK):
+            if fam in installed:
+                return fam
+    except Exception:
+        pass
+    return "Segoe UI" if _IS_WIN else ("Helvetica Neue" if _IS_MAC else "Arial")
+
+_FONT_FAMILY = None  # resolved lazily after Tk root exists
+
+def apple_font(size=13, weight="normal"):
+    """ctk.CTkFont with Apple-style family. Call after root window exists."""
+    global _FONT_FAMILY
+    if _FONT_FAMILY is None:
+        _FONT_FAMILY = _pick_font_family()
+    return ctk.CTkFont(family=_FONT_FAMILY, size=size, weight=weight)
+
+# Monkey-patch CTkFont so every widget picks up the Apple family unless
+# an explicit family is passed (e.g. "Consolas" for monospaced readouts).
+_CTkFont_orig = ctk.CTkFont
+def _CTkFont_apple(*args, **kwargs):
+    if "family" not in kwargs:
+        global _FONT_FAMILY
+        if _FONT_FAMILY is None:
+            _FONT_FAMILY = _pick_font_family()
+        kwargs["family"] = _FONT_FAMILY
+    return _CTkFont_orig(*args, **kwargs)
+ctk.CTkFont = _CTkFont_apple
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +507,7 @@ class ModAudioApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=C["danger"],
             fg_color=C["surface"],
-            corner_radius=8,
+            corner_radius=12,
             padx=10, pady=4,
         )
         self._status_badge.place(relx=1.0, x=-pad, y=20, anchor="ne")
@@ -489,7 +538,7 @@ class ModAudioApp(ctk.CTk):
                 fg_color=C["accent"],
                 hover_color="#5a73f5",
                 text_color="white",
-                corner_radius=8,
+                corner_radius=12,
                 height=36,
                 command=lambda n=name: self._apply_preset(n),
             )
@@ -510,7 +559,7 @@ class ModAudioApp(ctk.CTk):
             height=36,
             selected_color=C["accent"],
             selected_hover_color="#5a73f5",
-            corner_radius=8,
+            corner_radius=12,
             command=self._on_mode_change,
         )
         self._mode_seg.set("Headphones")
@@ -530,7 +579,7 @@ class ModAudioApp(ctk.CTk):
 
     def _build_devices(self, pad):
         f = ctk.CTkFrame(self._root_frame, fg_color=C["surface"],
-                         corner_radius=10)
+                         corner_radius=16)
         f.pack(fill="x", padx=pad, pady=(0, 4))
 
         rows = [
@@ -559,7 +608,7 @@ class ModAudioApp(ctk.CTk):
                 button_hover_color="#5a73f5",
                 dropdown_fg_color=C["surface2"],
                 dropdown_hover_color=C["surface"],
-                corner_radius=7,
+                corner_radius=12,
                 height=32,
                 command=lambda v, a=attr_menu: self._on_device_change(v, a),
             )
@@ -572,7 +621,7 @@ class ModAudioApp(ctk.CTk):
     # -- Level meters --------------------------------------------------------
 
     def _build_meters(self, pad):
-        f = ctk.CTkFrame(self._root_frame, fg_color=C["surface"], corner_radius=10)
+        f = ctk.CTkFrame(self._root_frame, fg_color=C["surface"], corner_radius=16)
         f.pack(fill="x", padx=pad, pady=(0, 4))
         f.grid_columnconfigure(1, weight=1)
 
@@ -613,7 +662,7 @@ class ModAudioApp(ctk.CTk):
     # -- Sliders -------------------------------------------------------------
 
     def _build_sliders(self, pad):
-        f = ctk.CTkFrame(self._root_frame, fg_color=C["surface"], corner_radius=10)
+        f = ctk.CTkFrame(self._root_frame, fg_color=C["surface"], corner_radius=16)
         f.pack(fill="x", padx=pad, pady=(0, 4))
         f.grid_columnconfigure(1, weight=1)
 
@@ -658,7 +707,7 @@ class ModAudioApp(ctk.CTk):
     # -- Volume --------------------------------------------------------------
 
     def _build_volume(self, pad):
-        f = ctk.CTkFrame(self._root_frame, fg_color=C["surface"], corner_radius=10)
+        f = ctk.CTkFrame(self._root_frame, fg_color=C["surface"], corner_radius=16)
         f.pack(fill="x", padx=pad, pady=(0, 4))
         f.grid_columnconfigure(1, weight=1)
 
@@ -698,7 +747,7 @@ class ModAudioApp(ctk.CTk):
             fg_color=C["success"],
             hover_color="#08f0b0",
             text_color="#0d1117",
-            corner_radius=12,
+            corner_radius=18,
             height=62,
             command=self._toggle,
         )
@@ -741,7 +790,7 @@ class ModAudioApp(ctk.CTk):
         _vdev_section_title = ("MODAUDIO SURROUND SPEAKER" if _IS_WIN
                                else "AUDIO CAPTURE SETUP")
         self._build_section(_vdev_section_title, pad, parent=ms)
-        f_vs = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=10)
+        f_vs = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=16)
         f_vs.pack(fill="x", padx=pad, pady=(0, 4))
         f_vs.grid_columnconfigure(1, weight=1)
 
@@ -811,7 +860,7 @@ class ModAudioApp(ctk.CTk):
             f_vbtn, text="Install Virtual Speaker",
             font=ctk.CTkFont(size=11, weight="bold"),
             fg_color=C["accent"], hover_color="#5a73f5",
-            text_color="white", corner_radius=7, height=32,
+            text_color="white", corner_radius=12, height=32,
             command=self._on_ms_install_driver,
         )
         self._ms_btn_install_driver.grid(row=0, column=0, padx=(0, 4), sticky="ew")
@@ -822,7 +871,7 @@ class ModAudioApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             fg_color=C["surface2"], hover_color=C["surface"],
             border_color=C["dim"], border_width=1,
-            text_color=C["dim"], corner_radius=7, height=32,
+            text_color=C["dim"], corner_radius=12, height=32,
             command=self._on_ms_set_default_device,
             state="disabled",
         )
@@ -834,7 +883,7 @@ class ModAudioApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             fg_color=C["surface2"], hover_color=C["surface"],
             border_color=C["accent"], border_width=1,
-            text_color=C["text"], corner_radius=7, height=32,
+            text_color=C["text"], corner_radius=12, height=32,
             command=self._on_ms_open_sound_settings,
         )
         self._ms_btn_sound_settings.grid(row=0, column=2, padx=(4, 0), sticky="ew")
@@ -850,7 +899,7 @@ class ModAudioApp(ctk.CTk):
             f_vs, text="▶  Auto-Configure Full Control (Both Speakers)",
             font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=C["success"], hover_color="#08f0b0",
-            text_color="#0d1117", corner_radius=8, height=36,
+            text_color="#0d1117", corner_radius=12, height=36,
             command=self._on_ms_autoconfigure,
         )
         self._ms_btn_autoconfigure.grid(row=5, column=0, columnspan=2,
@@ -862,7 +911,7 @@ class ModAudioApp(ctk.CTk):
 
         # --- SETUP MODE ------------------------------------------------------
         self._build_section("SETUP MODE", pad, parent=ms)
-        f_modesel = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=10)
+        f_modesel = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=16)
         f_modesel.pack(fill="x", padx=pad, pady=(0, 4))
 
         self._ms_mode_seg = ctk.CTkSegmentedButton(
@@ -872,7 +921,7 @@ class ModAudioApp(ctk.CTk):
             height=36,
             selected_color=C["accent"],
             selected_hover_color="#5a73f5",
-            corner_radius=8,
+            corner_radius=12,
             command=self._on_ms_mode_change,
         )
         self._ms_mode_seg.set("Loopback")
@@ -890,7 +939,7 @@ class ModAudioApp(ctk.CTk):
         # --- THEATER MODE ----------------------------------------------------
         # Preset selector specific to the multi-speaker chain.
         self._build_section("THEATER MODE", pad, parent=ms)
-        f_tm = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=10)
+        f_tm = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=16)
         f_tm.pack(fill="x", padx=pad, pady=(0, 4))
         f_tm.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
@@ -911,7 +960,7 @@ class ModAudioApp(ctk.CTk):
                 border_color=C["accent"],
                 border_width=1 if not is_sel else 0,
                 text_color="white" if is_sel else C["text"],
-                corner_radius=7, height=32,
+                corner_radius=12, height=32,
                 command=lambda n=nm: self._on_ms_theater_preset(n),
             )
             btn.grid(row=0, column=col,
@@ -928,7 +977,7 @@ class ModAudioApp(ctk.CTk):
 
         # --- OUTPUT DEVICES --------------------------------------------------
         self._build_section("OUTPUT DEVICES", pad, parent=ms)
-        f_dev = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=10)
+        f_dev = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=16)
         f_dev.pack(fill="x", padx=pad, pady=(0, 4))
         f_dev.grid_columnconfigure(1, weight=1)
 
@@ -951,7 +1000,7 @@ class ModAudioApp(ctk.CTk):
             button_hover_color="#5a73f5",
             dropdown_fg_color=C["surface2"],
             dropdown_hover_color=C["surface"],
-            corner_radius=7, height=32,
+            corner_radius=12, height=32,
             command=self._on_ms_cap_change,
         )
         self._ms_cap_menu.set(ms_in_cur)
@@ -1018,7 +1067,7 @@ class ModAudioApp(ctk.CTk):
 
         # --- BLUETOOTH DELAY -------------------------------------------------
         self._build_section("BLUETOOTH DELAY", pad, parent=ms)
-        f_bt = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=10)
+        f_bt = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=16)
         f_bt.pack(fill="x", padx=pad, pady=(0, 4))
         f_bt.grid_columnconfigure(1, weight=1)
 
@@ -1075,7 +1124,7 @@ class ModAudioApp(ctk.CTk):
             border_color=C["accent"],
             border_width=1,
             text_color=C["text"],
-            corner_radius=7, height=28, width=112,
+            corner_radius=12, height=28, width=112,
             command=self._on_ms_calibrate,
         )
         self._ms_btn_calibrate.grid(row=0, column=2)
@@ -1102,7 +1151,7 @@ class ModAudioApp(ctk.CTk):
         self._build_section("SPEAKER PLACEMENT", pad, parent=ms)
 
         # ---- Room canvas ------------------------------------------------
-        f_canvas_outer = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=10)
+        f_canvas_outer = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=16)
         f_canvas_outer.pack(fill="x", padx=pad, pady=(0, 4))
 
         canvas_w = self.W - pad * 2 - 4
@@ -1190,7 +1239,7 @@ class ModAudioApp(ctk.CTk):
         ).grid(row=1, column=len(_layout_names), padx=(4, 2), pady=(2, 0))
 
         # ---- Selected-speaker panel (hidden until a speaker is selected) --
-        self._ms_spk_panel = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=10)
+        self._ms_spk_panel = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=16)
         self._ms_spk_panel.pack(fill="x", padx=pad, pady=(0, 4))
         self._ms_spk_panel.grid_columnconfigure(1, weight=1)
         self._ms_spk_panel.grid_columnconfigure(3, weight=1)
@@ -1217,7 +1266,7 @@ class ModAudioApp(ctk.CTk):
             fg_color=C["surface2"],
             button_color=C["accent"], button_hover_color="#5a73f5",
             dropdown_fg_color=C["surface2"], dropdown_hover_color=C["surface"],
-            corner_radius=7, height=30,
+            corner_radius=12, height=30,
             command=self._on_ms_spk_dev_change,
         )
         self._ms_spk_dev_menu.grid(row=1, column=1, columnspan=2,
@@ -1228,7 +1277,7 @@ class ModAudioApp(ctk.CTk):
             self._ms_spk_panel, text="Remove",
             font=ctk.CTkFont(size=10),
             fg_color=C["danger"], hover_color="#f56070",
-            text_color="white", corner_radius=7, height=30, width=80,
+            text_color="white", corner_radius=12, height=30, width=80,
             command=self._on_ms_remove_speaker,
         )
         self._ms_spk_remove_btn.grid(row=1, column=3, padx=(0, 14),
@@ -1301,7 +1350,7 @@ class ModAudioApp(ctk.CTk):
 
         # --- CHANNEL ROUTING -------------------------------------------------
         self._build_section("CHANNEL ROUTING", pad, parent=ms)
-        f_route = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=10)
+        f_route = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=16)
         f_route.pack(fill="x", padx=pad, pady=(0, 4))
         f_route.grid_columnconfigure(1, weight=1)
 
@@ -1324,7 +1373,7 @@ class ModAudioApp(ctk.CTk):
 
         # --- LEVELS ----------------------------------------------------------
         self._build_section("LEVELS", pad, parent=ms)
-        f_met = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=10)
+        f_met = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=16)
         f_met.pack(fill="x", padx=pad, pady=(0, 4))
         f_met.grid_columnconfigure(1, weight=1)
 
@@ -1401,7 +1450,7 @@ class ModAudioApp(ctk.CTk):
             fg_color=C["success"],
             hover_color="#08f0b0",
             text_color="#0d1117",
-            corner_radius=12, height=54,
+            corner_radius=18, height=54,
             command=self._toggle_multi,
         )
         self._ms_start_btn.pack(fill="x")
@@ -1719,7 +1768,7 @@ class ModAudioApp(ctk.CTk):
             fg_color=C["surface2"],
             button_color=C["accent"], button_hover_color="#5a73f5",
             dropdown_fg_color=C["surface2"], dropdown_hover_color=C["surface"],
-            corner_radius=7, height=30,
+            corner_radius=12, height=30,
         )
         dev_menu.set(cur_name)
         dev_menu.grid(row=0, column=0, padx=(0, 4), pady=0, sticky="ew")
@@ -1731,7 +1780,7 @@ class ModAudioApp(ctk.CTk):
             fg_color=C["surface2"],
             button_color=C["accent"], button_hover_color="#5a73f5",
             dropdown_fg_color=C["surface2"], dropdown_hover_color=C["surface"],
-            corner_radius=7, height=30, width=148,
+            corner_radius=12, height=30, width=148,
         )
         dir_menu.set(direction)
         dir_menu.grid(row=0, column=1, padx=(0, 4), pady=0)
@@ -1742,7 +1791,7 @@ class ModAudioApp(ctk.CTk):
             fg_color=C["surface2"], hover_color=C["surface"],
             border_color=C["dim"], border_width=1,
             text_color=C["dim"],
-            corner_radius=7, height=30, width=68,
+            corner_radius=12, height=30, width=68,
         )
         bass_btn.grid(row=0, column=2, padx=(0, 4), pady=0)
 
@@ -1751,7 +1800,7 @@ class ModAudioApp(ctk.CTk):
             font=ctk.CTkFont(size=13, weight="bold"),
             fg_color=C["danger"], hover_color="#f56070",
             text_color="white",
-            corner_radius=7, height=30, width=30,
+            corner_radius=12, height=30, width=30,
         )
         del_btn.grid(row=0, column=3, pady=0)
 

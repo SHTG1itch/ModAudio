@@ -1,0 +1,53 @@
+# ModAudio Pi — example speaker layout
+#
+# Use `python pi_runner.py --list-devices` to find the sounddevice indices for
+# your Pi's capture (TV / HDMI-ARC / USB) and playback devices.
+
+sample_rate: 48000
+block_size: 512
+preset: Cinema            # Cinema | IMAX | Dolby | Home
+bass_priority: equal      # equal | front | rear
+bt_delay_ms: 0            # only needed for Bluetooth speakers
+
+input_device: 0           # e.g. HDMI-ARC capture, USB audio in, PulseAudio monitor
+
+# N speakers arranged around the listener. az/el in degrees:
+#   0 deg = front ahead, +90 deg = listener's right, +180 deg = directly behind.
+#   +el = above the listener.  face_az is the direction the speaker POINTS
+#   (defaults to az + 180, i.e. facing the listener).
+speakers:
+  - name: Front-Left
+    device: 2
+    az:  -30
+    el:    0
+    face_az: 150
+
+  - name: Front-Right
+    device: 3
+    az:   30
+    face_az: 210
+
+  - name: Center
+    device: 4
+    az:    0
+    face_az: 180
+
+  - name: Rear-Left
+    device: 5
+    az: -110
+    face_az:  70
+
+  - name: Rear-Right
+    device: 6
+    az:  110
+    face_az: 290
+
+# For Atmos-style height rendering, switch `preset: Dolby` above and add
+# elevated speakers — e.g.:
+#
+#   - name: Top-Front-Left
+#     device: 7
+#     az: -45
+#     el:  45
+#     face_az: 135
+#     face_el: -45

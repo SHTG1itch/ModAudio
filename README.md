@@ -32,10 +32,16 @@ Transform your audio playback into an immersive theater experience with **ModAud
 - **Behind spectral coloring** — psychoacoustic processing helps you localize rear speakers as coming from behind
 - **3D Room Visualization** — interactive 3D room canvas for speaker placement, device assignment, and real-time sound wave animation
 
+### 📺 Raspberry Pi / TV Add-on
+- **Headless runner (`pi_runner.py`)** — drop a Pi behind your TV and it becomes a dedicated surround-sound processor
+- **No GUI dependency** — runs on Pi OS Lite; drives HDMI, USB DACs, 3.5 mm, or Bluetooth speakers
+- **YAML config** — declare your speaker layout once, start at boot via systemd
+- **Atmos-style heights work too** — add elevated speakers to the config and the Dolby preset sends overhead content to them
+
 ### 🎚️ Theater Presets
 - **Cinema** — Standard commercial cinema sound (RT60 1.3s, 6 dB bass boost)
 - **IMAX** — Massive room, overwhelming scale, deep bass impact (RT60 1.9s, 10 dB bass boost)
-- **Dolby** — Precision-tuned, tighter room, clean dialog intelligibility (RT60 0.95s, 4 dB bass boost)
+- **Dolby** — Precision-tuned, tighter room, clean dialog intelligibility (RT60 0.95s, 4 dB bass boost) + **Atmos-style 7.1.4 height rendering** that degrades gracefully on smaller setups
 - **Home** — Subtle theater enhancement for residential listening (RT60 0.8s, 3 dB bass boost)
 
 ### 🎛️ Real-Time Control
@@ -462,12 +468,15 @@ Extreme-scale theatrical experience mimicking IMAX auditoriums (70mm film, massi
 - **Use for:** Action blockbusters, immersive entertainment, bass-heavy content
 
 ### Dolby
-Precision-engineered for **Dolby Cinema** standards — clarity, articulation, and accurate localization.
+Precision-engineered for **Dolby Cinema** standards — clarity, articulation, and accurate localization. Also enables **Atmos-style height rendering**.
 - **Room:** Tight, acoustically controlled (RT60 0.95s, minimal early reflections)
 - **Bass:** Conservative, 4 dB boost (relies on system headroom)
 - **Surround:** Subtle but precise (surround 68%, rear 58%)
 - **Dynamics:** Gentle compression (1.2×), restrained transients
-- **Use for:** Dialog-heavy content, dramatic performances, audiophile listening
+- **Heights:** 7.1.4-style overhead virtual channels (TFL/TFR/TRL/TRR at ±45° azimuth, +45° elevation). If you place elevated speakers in the 3D room canvas they receive genuine height content; if you do not, the height sends gracefully fall back to your nearest ground speakers, preserving the spatial intent even on small setups.
+- **Use for:** Dialog-heavy content, dramatic performances, audiophile listening, any source you want rendered with an Atmos-style spatial impression.
+
+> **Note on Dolby Atmos compliance.** True Dolby Atmos delivery requires E-AC-3 JOC or MAT object metadata, which is only present in the original Atmos bitstream. ModAudio processes decoded PCM stereo, so it cannot play back native Atmos objects. What the Dolby preset does instead is render an **Atmos-inspired virtual 7.1.4 spatial field** from stereo input — height channels are derived from the surround/rear field through a specular-reflection-shaped filter and routed via 3D great-circle VBAP to whichever physical speakers you have. The result is a convincing overhead impression on any speaker layout without pretending to be an Atmos decoder.
 
 ### Home
 Residential listening preset with minimal bass boost and moderate room simulation.
@@ -678,6 +687,82 @@ python main.py --mode headphones --drive 1.9 --gain -2
 ```bash
 python main.py --list-devices
 ```
+
+---
+
+## Raspberry Pi / TV Add-on
+
+ModAudio ships with a separate **headless runner** for Raspberry Pi (or any Linux box) that plugs into your TV as a surround-sound processor. It's isolated from the GUI code — the Pi runner never imports `customtkinter`, so you can install it on Pi OS Lite without a display server.
+
+### What This Is For
+Turn a Pi 4/5 (or even a Pi Zero 2) into a dedicated cinema-DSP box for your living-room TV. It captures the TV's audio (via HDMI-ARC, a USB audio capture card, or a PulseAudio monitor), processes it through the same theater chain the desktop app uses, and drives two to many physical speakers — HDMI, 3.5 mm, USB DACs, Bluetooth, or any mix. The Atmos-style height rendering from the Dolby preset works here too: add elevated speakers to the config and they receive overhead content.
+
+### Install on the Pi
+```bash
+git clone https://github.com/<your-fork>/ModAudio.git
+cd ModAudio
+sudo apt install python3-pip portaudio19-dev
+pip install -r requirements.txt pyyaml
+```
+
+### Configure Your Speaker Layout
+Discover device indices first:
+```bash
+python pi_runner.py --list-devices
+```
+
+Copy the example config and edit it:
+```bash
+cp pi_config.example.yaml pi_config.yaml
+# edit `input_device`, `speakers[*].device`, and the azimuth/elevation angles
+```
+
+Speaker entries use the same conventions as the GUI's 3D room canvas:
+`az` measures azimuth in degrees (0 = directly ahead, +90 = listener's right, +180 = directly behind), `el` is elevation above the listener, and `face_az` is the direction the speaker points (defaults to `az + 180`, i.e. facing the listener). A minimal 4-speaker surround layout looks like this:
+
+```yaml
+sample_rate: 48000
+block_size: 512
+preset: Cinema            # Cinema | IMAX | Dolby | Home
+bass_priority: equal
+input_device: 0           # your HDMI-ARC / USB capture / PulseAudio monitor
+speakers:
+  - { name: FL, device: 2, az:  -30 }
+  - { name: FR, device: 3, az:   30 }
+  - { name: RL, device: 4, az: -110 }
+  - { name: RR, device: 5, az:  110 }
+```
+
+Validate before you run:
+```bash
+python pi_runner.py -c pi_config.yaml --check
+```
+
+### Run It
+```bash
+python pi_runner.py -c pi_config.yaml
+```
+Ctrl-C to stop. It stays in the foreground and prints elapsed time plus xrun counts every few seconds.
+
+### Make It Start at Boot (systemd)
+```bash
+python pi_runner.py --print-systemd -c /home/pi/ModAudio/pi_config.yaml | \
+    sudo tee /etc/systemd/system/modaudio.service > /dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --now modaudio.service
+sudo journalctl -u modaudio -f    # watch the log
+```
+
+The unit runs under your user account with `Nice=-10` so the DSP thread gets reliable scheduling. It auto-restarts on failure.
+
+### Audio Capture on the Pi
+- **HDMI-ARC capture:** easiest, plug the TV's ARC port into a cheap HDMI capture stick.
+- **USB audio in:** any class-compliant USB audio adapter with a line-in.
+- **Bluetooth A2DP sink:** Pi acts as a Bluetooth speaker target; the TV sends audio over Bluetooth. Enable via `bluetoothctl`.
+- **PulseAudio monitor:** if the Pi itself plays back media, capture its own output via the `.monitor` source.
+
+### Atmos on the Pi
+Set `preset: Dolby` and add elevated speakers — e.g. a ceiling pair at `az: ±45, el: 45`. No height speakers? Leave them out; heights gracefully fall back to your ground speakers. Same two-step VBAP engine as the desktop app.
 
 ---
 

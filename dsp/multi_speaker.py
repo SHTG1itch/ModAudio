@@ -280,37 +280,56 @@ def _build_routing_matrix(front_info: tuple, rear_info: tuple,
     return M
 
 
+# 4 Atmos-style height virtual channels (7.1.4): top-front and top-rear, ±45° el.
+_HEIGHT_VIRT_AZ_EL = [
+    (-45.0,  45.0),   # TFL : top-front-left
+    ( 45.0,  45.0),   # TFR : top-front-right
+    (-135.0, 45.0),   # TRL : top-rear-left
+    ( 135.0, 45.0),   # TRR : top-rear-right
+]
+
+
 def _build_routing_matrix_n_stereo(
-    speaker_info: list, half_width: float = 15.0
+    speaker_info: list, half_width: float = 15.0,
+    include_heights: bool = False,
 ) -> np.ndarray:
     """
-    Build 7×2N VBAP routing matrix for N physical stereo speakers.
+    Build VBAP routing matrix for N physical stereo speakers.
 
     Each speaker contributes two columns:
       Column 2*i   = L driver (speaker's left)
       Column 2*i+1 = R driver (speaker's right)
 
+    Without heights → shape (7, 2N):  FL, FR, C, LS, RS, LB, RB.
+    With heights   → shape (11, 2N): FL, FR, C, LS, RS, LB, RB, TFL, TFR, TRL, TRR.
+
     Uses two-step routing to avoid VBAP degeneracy caused by adjacent
     inward-facing speakers sharing coincident inner driver positions:
 
-      1. VBAP across N speaker center-azimuths → per-speaker gain (constant power)
+      1. VBAP across N speaker center positions (az, el) on the sphere →
+         per-speaker gain (constant power)
       2. Within each speaker, constant-power pan between its L and R driver positions
 
-    This preserves constant overall power (each step is constant-power) and
-    correctly images the stereo field for any speaker placement and facing.
+    Height channels degrade gracefully: if any physical speaker has elevation
+    >0, heights route there via `_vbap_sphere`; otherwise they fall back to the
+    nearest ground speakers (Dolby Atmos "speaker virtualisation" behaviour).
 
     Parameters
     ----------
-    speaker_info : list of (az, el, face_az, face_el) for each speaker (degrees)
-    half_width   : angular half-width between L/R virtual drivers (degrees)
+    speaker_info    : list of (az, el, face_az, face_el) per speaker (degrees)
+    half_width      : angular half-width between L/R virtual drivers (degrees)
+    include_heights : if True, append 4 overhead virtual channels (7.1.4 layout)
     """
-    _VIRT_AZ = [-30.0, 30.0, 0.0, -110.0, 110.0, -150.0, 150.0]
+    _GROUND_VIRT_AZ_EL = [(-30.0, 0.0), (30.0, 0.0), (0.0, 0.0),
+                          (-110.0, 0.0), (110.0, 0.0),
+                          (-150.0, 0.0), (150.0, 0.0)]
+    virt_az_el = list(_GROUND_VIRT_AZ_EL)
+    if include_heights:
+        virt_az_el += _HEIGHT_VIRT_AZ_EL
+
     N = len(speaker_info)
 
     # Pre-compute speaker center positions and L/R driver azimuths.
-    # center_az_els stores (az, el) for each speaker so that step-1 VBAP
-    # uses true 3D angular distance — this correctly routes to height speakers
-    # (e.g. Dolby Atmos overhead) instead of relying on azimuth alone.
     center_az_els: list = []
     driver_pairs: list = []          # [(L_az, R_az), ...]
     for az, el, face_az, face_el in speaker_info:
@@ -318,16 +337,11 @@ def _build_routing_matrix_n_stereo(
         l_az, _, r_az, _ = _speaker_driver_az_el(az, el, face_az, face_el, half_width)
         driver_pairs.append((l_az, r_az))
 
-    # Virtual channels are defined on the horizontal plane (el=0°).
-    _VIRT_EL = 0.0
+    M = np.zeros((len(virt_az_el), 2 * N), dtype=np.float32)
 
-    M = np.zeros((7, 2 * N), dtype=np.float32)
-
-    for j, vaz in enumerate(_VIRT_AZ):
+    for j, (vaz, vel) in enumerate(virt_az_el):
         # Step 1: route virtual source to speakers using 3D great-circle VBAP.
-        # Handles elevation (e.g. Atmos height speakers) correctly while
-        # being identical to horizontal VBAP when all elevations are zero.
-        spk_gains = _vbap_sphere(vaz, _VIRT_EL, center_az_els)  # shape (N,)
+        spk_gains = _vbap_sphere(vaz, vel, center_az_els)  # shape (N,)
 
         for i, (l_az, r_az) in enumerate(driver_pairs):
             g = float(spk_gains[i])
@@ -335,12 +349,8 @@ def _build_routing_matrix_n_stereo(
                 continue
 
             # Step 2: constant-power pan between this speaker's L and R drivers.
-            # span = clockwise arc from L to R (always ≥ 0).
-            # signed_diff = signed arc from L to source in (−180, +180]; clamping
-            # it to [0, span] means sources left-of-L → all L, right-of-R → all R.
             span = (r_az - l_az) % 360.0       # arc from L to R going CW (>0)
             if span < 0.5:
-                # Degenerate speaker (L≈R): split evenly
                 M[j, 2*i]   += g * 0.7071068
                 M[j, 2*i+1] += g * 0.7071068
                 continue
@@ -642,13 +652,30 @@ class MultiSpeakerChainN:
         self._bass_priority = bass_priority
         self._master_gain = 10 ** (float(preset.get("output_gain_db", 0.0)) / 20.0)
 
+        # Atmos-style height processing. When `atmos_mode` is set in the preset
+        # and `height_level` > 0, the routing matrix is expanded with 4 overhead
+        # virtual channels (7.1.4 layout). Graceful degradation: if no physical
+        # speaker is elevated, heights fall back to the nearest ground speakers
+        # via _vbap_sphere, preserving imaging intent even on small setups.
+        self._atmos_mode   = bool(preset.get("atmos_mode", False))
+        self._height_level = float(preset.get("height_level", 0.0))
+        self._use_heights  = self._atmos_mode and self._height_level > 0.001
+
         # Build the combined speaker_info list and rebuild routing matrix
         self._azimuths: list[float] = list(speaker_azimuths)
         self._N = len(self._azimuths)
         self._speaker_info = self._make_speaker_info(
             self._azimuths, speaker_elevations, speaker_face_azs, speaker_face_els)
-        # 7 × 2N routing matrix (L and R driver columns per speaker)
-        self._routing_matrix = _build_routing_matrix_n_stereo(self._speaker_info)
+        self._routing_matrix = _build_routing_matrix_n_stereo(
+            self._speaker_info, include_heights=self._use_heights)
+
+        # Height-impression filter: HP at 400 Hz + slight HF shelf boost.
+        # Above-listener specular reflections are characterised by reduced
+        # bass energy and brighter HF, so we shape the height send accordingly.
+        self._height_hp = make_highpass(400.0, q=0.707, fs=fs, ch=2)
+        self._height_shelf = FilterChain([
+            make_highshelf(6000.0, +2.0, q=0.707, fs=fs, ch=2),
+        ])
 
         # ---- Shared theater DSP (same pipeline as MultiSpeakerChain) ----
         self._bass_enh = HarmonicBassEnhancer(
@@ -775,8 +802,8 @@ class MultiSpeakerChainN:
         # 7-channel adaptive upmix
         ch = self._upmix.process(mid)
 
-        # Stack into (frames, 7) matrix with per-channel levels applied
-        sig = np.stack([
+        # Stack ground-level channels into (frames, 7) matrix with levels applied
+        ground = np.stack([
             ch["FL"].astype(np.float64),
             ch["FR"].astype(np.float64),
             ch["C"].astype(np.float64)  * self._cl,
@@ -786,7 +813,30 @@ class MultiSpeakerChainN:
             ch["RB"].astype(np.float64) * self._rear_level,
         ], axis=1)   # (frames, 7)
 
-        # VBAP routing: (frames, 7) @ (7, 2N) → (frames, 2N)
+        if self._use_heights:
+            # Height-channel derivation: tap LS/RS for front-heights (TFL/TFR)
+            # and LB/RB for rear-heights (TRL/TRR). Pass them through the
+            # height-impression filter (HP @ 400 Hz + HF shelf boost) — this
+            # removes bass rumble and brightens the HF, mimicking specular
+            # ceiling reflections. When a physical ceiling/height speaker is
+            # placed in the 3D room canvas, _vbap_sphere routes to it; if not,
+            # these signals gracefully fall back to the nearest ground speakers.
+            h_front = np.stack([ch["LS"], ch["RS"]], axis=1).astype(np.float32)
+            h_rear  = np.stack([ch["LB"], ch["RB"]], axis=1).astype(np.float32)
+            h_front = self._height_shelf.process(self._height_hp.process(h_front))
+            h_rear  = self._height_shelf.process(self._height_hp.process(h_rear))
+            h_scale = self._height_level
+            heights = np.stack([
+                h_front[:, 0].astype(np.float64) * h_scale,   # TFL
+                h_front[:, 1].astype(np.float64) * h_scale,   # TFR
+                h_rear [:, 0].astype(np.float64) * h_scale,   # TRL
+                h_rear [:, 1].astype(np.float64) * h_scale,   # TRR
+            ], axis=1)
+            sig = np.concatenate([ground, heights], axis=1)
+        else:
+            sig = ground
+
+        # VBAP routing: (frames, V) @ (V, 2N) → (frames, 2N)
         # Each speaker occupies columns 2*i (L driver) and 2*i+1 (R driver).
         M     = self._routing_matrix.astype(np.float64)
         buses = sig @ M   # (frames, 2N)
@@ -846,7 +896,8 @@ class MultiSpeakerChainN:
             self._azimuths, elevations, face_azs, face_els)
         n_new = len(self._azimuths)
 
-        self._routing_matrix = _build_routing_matrix_n_stereo(self._speaker_info)
+        self._routing_matrix = _build_routing_matrix_n_stereo(
+            self._speaker_info, include_heights=self._use_heights)
 
         if n_new != self._N:
             self._N = n_new
@@ -869,7 +920,8 @@ class MultiSpeakerChainN:
 
     def reset(self):
         for stage in (self._bass_enh, self._air_exc, self._eq, self._reverb,
-                      self._comp, self._trans, self._lp_sub, self._hp_mid):
+                      self._comp, self._trans, self._lp_sub, self._hp_mid,
+                      self._height_hp, self._height_shelf):
             stage.reset()
         self._upmix.reset()
         for lim in self._limiters:
