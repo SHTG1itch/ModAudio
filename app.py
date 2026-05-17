@@ -352,51 +352,62 @@ class ModAudioApp(ctk.CTk):
 
     def _build_device_lists(self):
         """
-        Input list  – only loopback / system-capture sources so the user can
-                      only capture audio that is already playing on the PC.
-        Out list    – rebuilt dynamically to match the input's host API.
+        Input list  – loopback / system-capture sources first (marked ★),
+                      followed by all other inputs (mic, line-in, etc.).
+                      ★ devices are recommended because they capture what the
+                      system is already playing, so the DSP processes real
+                      audio rather than microphone input.
+        Out list    – rebuilt by _compatible_outputs(), always shows the
+                      best-quality outputs (WASAPI/CoreAudio) independently
+                      of which input is selected.
         Each entry is (device_idx, display_name).
         """
-        capture_devs = []
+        loopback_devs = []
+        other_devs    = []
+        seen = set()
         for i, d in enumerate(self._devs):
             if d["max_input_channels"] < 1:
                 continue
-            nl = d["name"].lower()
+            nl  = d["name"].lower()
+            tag = self._hostapi_label(d["hostapi"])
             if any(kw in nl for kw in self._LOOPBACK_KW):
-                tag   = self._hostapi_label(d["hostapi"])
+                label = f"★ {d['name'][:42]}  [{tag}]"   # ★ prefix
+                loopback_devs.append((i, label))
+                seen.add(i)
+            else:
                 label = f"{d['name'][:44]}  [{tag}]"
-                capture_devs.append((i, label))
+                other_devs.append((i, label))
+                seen.add(i)
 
-        # Fallback: if no loopback devices found, show all input devices
-        if not capture_devs:
-            for i, d in enumerate(self._devs):
-                if d["max_input_channels"] >= 1:
-                    tag   = self._hostapi_label(d["hostapi"])
-                    label = f"{d['name'][:44]}  [{tag}]"
-                    capture_devs.append((i, label))
-
-        self._in_list = capture_devs
+        # Loopback/system-audio sources first (strongly preferred for Theater mode)
+        self._in_list = loopback_devs + other_devs
+        if not self._in_list:
+            self._in_list = [(0, "Default Input")]
 
     def _compatible_outputs(self, input_dev_idx: int) -> list:
         """
-        Return list of (device_idx, display_name) for output devices that
-        share the same host API as input_dev_idx.  Falls back to all outputs
-        if nothing matches.
+        Return output devices for the Theater single-speaker tab.
+
+        Always returns the platform's best-quality outputs (WASAPI on Windows,
+        CoreAudio on macOS) regardless of the input device's host API.  This
+        lets users pick WASAPI speakers even when the capture source is an
+        MME device (e.g. Stereo Mix [MME]).  A cross-API duplex stream is
+        attempted at start time; if it fails, separate input/output streams
+        are used automatically.
         """
-        ha = self._dev_hostapi(input_dev_idx)
-        same_api = []
+        pref = self._preferred_api_label()
+        pref_outs = []
         for i, d in enumerate(self._devs):
             if d["max_output_channels"] < 1:
                 continue
-            if d["hostapi"] == ha:
+            if self._hostapi_label(d["hostapi"]) == pref:
                 tag   = self._hostapi_label(d["hostapi"])
                 label = f"{d['name'][:44]}  [{tag}]"
-                same_api.append((i, label))
+                pref_outs.append((i, label))
+        if pref_outs:
+            return pref_outs
 
-        if same_api:
-            return same_api
-
-        # Fallback: all output devices
+        # Fallback: all output devices (any API)
         out = []
         for i, d in enumerate(self._devs):
             if d["max_output_channels"] >= 1:
@@ -406,12 +417,12 @@ class ModAudioApp(ctk.CTk):
         return out
 
     def _refresh_out_menu(self):
-        """Rebuild the output dropdown to only show devices compatible with current input."""
+        """Rebuild the Speaker dropdown (preferred-API outputs, independent of input API)."""
         compat = self._compatible_outputs(self._in_dev_idx)
         self._out_list = compat
         names = [label for _, label in compat]
         if not names:
-            names = ["No compatible output found"]
+            names = ["No output devices found"]
 
         # Try to keep the previously selected output if it's still valid
         cur_name = next((label for idx, label in compat if idx == self._out_dev_idx), None)
@@ -554,7 +565,7 @@ class ModAudioApp(ctk.CTk):
 
         self._mode_seg = ctk.CTkSegmentedButton(
             f,
-            values=["Headphones", "Speakers", "Surround", "Mono"],
+            values=["Headphones", "Speakers", "Surround", "1 Speaker"],
             font=ctk.CTkFont(size=12),
             height=36,
             selected_color=C["accent"],
@@ -582,17 +593,27 @@ class ModAudioApp(ctk.CTk):
                          corner_radius=16)
         f.pack(fill="x", padx=pad, pady=(0, 4))
 
+        # Row 0: Audio In label + dropdown
+        # Row 1: hint for audio in
+        # Row 2: Speaker label + dropdown
+        # Row 3: hint for speaker
         rows = [
-            ("Capture", self._in_list,  "_in_dev_menu",  "_in_dev_idx"),
-            ("Output",  self._out_list, "_out_dev_menu", "_out_dev_idx"),
+            ("Audio In",  self._in_list,  "_in_dev_menu",  "_in_dev_idx",
+             "★ = system audio loopback (recommended)  ·  others = mic/line-in"),
+            ("Speaker",   self._out_list, "_out_dev_menu", "_out_dev_idx",
+             "Processed audio plays here — pick your speaker or headphones"),
         ]
-        for r, (label, dev_list, attr_menu, attr_idx) in enumerate(rows):
+        for r, (label, dev_list, attr_menu, attr_idx, hint_txt) in enumerate(rows):
+            grid_row   = r * 2
+            hint_row   = r * 2 + 1
+            top_pad    = 10 if r == 0 else 6
+
             ctk.CTkLabel(
                 f, text=label,
                 font=ctk.CTkFont(size=12),
                 text_color=C["dim"],
                 width=60, anchor="w",
-            ).grid(row=r, column=0, padx=(14, 6), pady=8, sticky="w")
+            ).grid(row=grid_row, column=0, padx=(14, 6), pady=(top_pad, 0), sticky="w")
 
             names    = [d[1] for d in dev_list]
             cur_idx  = getattr(self, attr_idx)
@@ -613,8 +634,16 @@ class ModAudioApp(ctk.CTk):
                 command=lambda v, a=attr_menu: self._on_device_change(v, a),
             )
             menu.set(cur_name)
-            menu.grid(row=r, column=1, padx=(0, 14), pady=8, sticky="ew")
+            menu.grid(row=grid_row, column=1, padx=(0, 14), pady=(top_pad, 0), sticky="ew")
             setattr(self, attr_menu, menu)
+
+            ctk.CTkLabel(
+                f, text=hint_txt,
+                font=ctk.CTkFont(size=9),
+                text_color=C["dim"],
+                anchor="w",
+            ).grid(row=hint_row, column=0, columnspan=2, padx=14,
+                   pady=(1, 4 if r == 1 else 0), sticky="ew")
 
         f.grid_columnconfigure(1, weight=1)
 
@@ -2562,9 +2591,10 @@ class ModAudioApp(ctk.CTk):
     # Mode label shown under the segmented button
     _MODE_DESCS = {
         "headphones":   "Binaural 5.1 HRTF — optimised for headphones",
-        "speakers":     "Stereo widening + Haas depth — for speaker playback",
+        "speakers":     "Stereo widening + Haas depth — for a stereo speaker pair",
         "surround":     "Virtual 7.1 HRTF with elevation — headphones or speakers",
-        "surround_mono":"7.1 HRTF collapsed to mono — works with a single speaker",
+        "surround_mono":"Virtual 7.1 upmix + room reflections collapsed to one speaker — "
+                        "select this for single-speaker surround simulation",
     }
 
     def _on_mode_change(self, value):
@@ -2572,7 +2602,8 @@ class ModAudioApp(ctk.CTk):
             "Headphones": "headphones",
             "Speakers":   "speakers",
             "Surround":   "surround",
-            "Mono":       "surround_mono",
+            "Mono":       "surround_mono",   # legacy name kept for safety
+            "1 Speaker":  "surround_mono",
         }
         self._mode = mapping.get(value, "headphones")
         if hasattr(self, "_mode_desc"):
@@ -2885,6 +2916,13 @@ class ModAudioApp(ctk.CTk):
         else:
             self._start()
 
+    # ------------------------------------------------------------------
+    # Dual-stream state (used when input and output are on different APIs)
+    # ------------------------------------------------------------------
+    _dual_in_stream  = None
+    _dual_out_stream = None
+    _dual_queue      = None   # queue.SimpleQueue of np.ndarray blocks
+
     def _start(self):
         # Interlock: stop multi-speaker if it is running
         if self._ms_running:
@@ -2899,12 +2937,12 @@ class ModAudioApp(ctk.CTk):
         in_dev  = self._in_dev_idx
         out_dev = self._out_dev_idx
 
+        # Query channel counts
         try:
-            in_info  = sd.query_devices(in_dev,  "input")
-            in_ch    = min(in_info["max_input_channels"], 2)
+            in_info = sd.query_devices(in_dev, "input")
+            in_ch   = min(in_info["max_input_channels"], 2)
         except Exception:
             in_ch = 2
-
         try:
             out_info = sd.query_devices(out_dev, "output")
             out_ch   = min(out_info["max_output_channels"], 8)
@@ -2912,6 +2950,7 @@ class ModAudioApp(ctk.CTk):
         except Exception:
             out_ch = 2
 
+        # Try duplex stream (both devices on same host API — ideal path)
         try:
             self._stream = sd.Stream(
                 samplerate=SAMPLE_RATE,
@@ -2925,8 +2964,107 @@ class ModAudioApp(ctk.CTk):
             self._stream.start()
             self._running = True
             self._set_running_ui(True)
-        except Exception as e:
-            self._show_error(f"Could not open audio stream:\n{e}\n\nCheck device selection.")
+            return
+        except Exception as duplex_err:
+            in_api  = self._hostapi_label(self._dev_hostapi(in_dev))
+            out_api = self._hostapi_label(self._dev_hostapi(out_dev))
+            if in_api == out_api:
+                # Same API but still failed — real error, show it
+                self._show_error(
+                    f"Could not open audio stream:\n{duplex_err}\n\n"
+                    "Tips:\n"
+                    "• Make sure no other app is using the device exclusively.\n"
+                    "• Check that both devices support 48 kHz sample rate.\n"
+                    "• Try selecting a different Audio In source."
+                )
+                return
+            # Cross-API mismatch — fall through to dual-stream path below
+            print(f"[audio] Duplex failed ({in_api}→{out_api}), trying dual streams…")
+
+        # Dual-stream fallback: separate InputStream + OutputStream.
+        # Needed when capture (e.g. Stereo Mix [MME]) and speaker (e.g. [WASAPI])
+        # are on different host APIs that PortAudio cannot open as a single duplex.
+        import queue as _queue
+        self._dual_queue = _queue.SimpleQueue()
+        _q = self._dual_queue
+
+        def _in_cb(indata, frames, time_info, status):
+            if status:
+                self._xruns += 1
+            chain = self._chain
+            if chain is None:
+                return
+            try:
+                block = np.ascontiguousarray(
+                    indata[:, :2] if indata.shape[1] >= 2
+                    else np.column_stack([indata[:, 0], indata[:, 0]]),
+                    dtype=np.float32,
+                )
+                sq = block * block
+                self._raw_in = np.sqrt(
+                    np.array([sq[:, 0].mean(), sq[:, 1].mean()], dtype=np.float32))
+                result = chain.process(block) * self._master_gain
+                sq2 = result * result
+                self._raw_out = np.sqrt(
+                    np.array([sq2[:, 0].mean(), sq2[:, 1].mean()], dtype=np.float32))
+                _q.put(result)
+                self._blk_count += 1
+            except Exception as exc:
+                print(f"[audio_in] {exc}")
+
+        def _out_cb(outdata, frames, time_info, status):
+            if status:
+                self._xruns += 1
+            try:
+                block = _q.get_nowait()
+            except Exception:
+                block = np.zeros((frames, 2), dtype=np.float32)
+            out_ch_use = min(outdata.shape[1], 2)
+            outdata[:, :out_ch_use] = block[:frames, :out_ch_use]
+            if outdata.shape[1] > out_ch_use:
+                outdata[:, out_ch_use:] = 0.0
+
+        try:
+            self._dual_in_stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE,
+                device=in_dev, channels=in_ch, dtype="float32",
+                callback=_in_cb, latency="low",
+            )
+            self._dual_out_stream = sd.OutputStream(
+                samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE,
+                device=out_dev, channels=out_ch, dtype="float32",
+                callback=_out_cb, latency="low",
+            )
+            self._dual_in_stream.start()
+            self._dual_out_stream.start()
+            self._running = True
+            self._set_running_ui(True)
+            in_name  = sd.query_devices(in_dev)["name"]
+            out_name = sd.query_devices(out_dev)["name"]
+            print(f"  [dual-stream] In: {in_name}  Out: {out_name}")
+        except Exception as dual_err:
+            # Clean up any partially opened streams
+            for s in (self._dual_in_stream, self._dual_out_stream):
+                if s is not None:
+                    try:
+                        s.stop(); s.close()
+                    except Exception:
+                        pass
+            self._dual_in_stream = self._dual_out_stream = None
+            in_name  = sd.query_devices(in_dev)["name"]  if in_dev  is not None else "?"
+            out_name = sd.query_devices(out_dev)["name"] if out_dev is not None else "?"
+            in_api   = self._hostapi_label(self._dev_hostapi(in_dev))
+            out_api  = self._hostapi_label(self._dev_hostapi(out_dev))
+            self._show_error(
+                f"Could not open audio stream:\n{dual_err}\n\n"
+                f"Audio In:  {in_name}  [{in_api}]\n"
+                f"Speaker:   {out_name}  [{out_api}]\n\n"
+                "Suggested fixes:\n"
+                "• On Windows: enable Stereo Mix in Sound Settings → Recording tab,\n"
+                "  right-click → Show Disabled Devices.\n"
+                "• Or install VB-Cable (free) for a reliable loopback source.\n"
+                "• Make sure the Audio In device supports 48 kHz."
+            )
 
     def _stop(self):
         self._running = False
@@ -2934,6 +3072,15 @@ class ModAudioApp(ctk.CTk):
             self._stream.stop()
             self._stream.close()
             self._stream = None
+        # Stop dual-stream fallback if it was used
+        for s in (self._dual_in_stream, self._dual_out_stream):
+            if s is not None:
+                try:
+                    s.stop(); s.close()
+                except Exception:
+                    pass
+        self._dual_in_stream = self._dual_out_stream = None
+        self._dual_queue = None
         self._set_running_ui(False)
         # Decay meters to silence
         self._raw_in[:] = 0

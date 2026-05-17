@@ -52,52 +52,95 @@ def find_default_devices() -> tuple[int | None, int | None]:
     """
     Auto-detect the best input/output device pair.
 
-    Priority for input:
-      1. VB-Cable Output   (Windows: "CABLE Output")
-      2. BlackHole         (macOS virtual loopback)
-      3. Soundflower       (macOS, legacy)
-      4. VB-Cable          (macOS variant — no "output" suffix)
-      5. Stereo Mix / What U Hear  (Windows)
-      6. Any device with "loopback" in the name
-      7. System default input
+    Input priority:
+      1. WASAPI VB-Cable Output  (best quality, lowest latency on Windows)
+      2. WASAPI BlackHole / Soundflower  (macOS equivalent)
+      3. Any VB-Cable / BlackHole / Soundflower on any API
+      4. Stereo Mix / What U Hear  (Windows fallback, no extra software)
+      5. Any device with "loopback" in the name
+      6. System default input
+
+    The WASAPI variant is preferred over MME/DS because a WASAPI loopback
+    source paired with a WASAPI speaker opens as a clean single duplex
+    stream (no cross-API bridging required).
     """
-    devices = sd.query_devices()
+    devices  = sd.query_devices()
+    hostapis = sd.query_hostapis()
     input_id  = None
     output_id = None
 
-    # High-priority loopback sources (first match wins)
+    # Determine preferred host-API label for this platform
+    import sys as _sys
+    if _sys.platform == "win32":
+        _pref_api = "WASAPI"
+    elif _sys.platform == "darwin":
+        _pref_api = "CoreAudio"
+    else:
+        _pref_api = None   # prefer any
+
+    def _api_label(ha_idx: int) -> str:
+        try:
+            name = hostapis[ha_idx]["name"]
+            if "WASAPI"      in name: return "WASAPI"
+            if "MME"         in name: return "MME"
+            if "DirectSound" in name: return "DS"
+            if "Core Audio"  in name: return "CoreAudio"
+            return name[:8]
+        except (IndexError, KeyError):
+            return "?"
+
+    # High-priority loopback keywords
     _high = ("cable output", "blackhole", "soundflower", "vb-cable")
-    # Medium-priority (Windows system capture)
     _med  = ("stereo mix", "what u hear", "wave out mix")
-    # Low-priority fallback
     _low  = ("loopback",)
 
-    for i, d in enumerate(devices):
-        if d["max_input_channels"] < 1:
-            continue
-        nl = d["name"].lower()
-        if any(kw in nl for kw in _high):
-            input_id = i
-            break
+    # Pass 1: preferred-API high-priority loopback
+    if _pref_api:
+        for i, d in enumerate(devices):
+            if d["max_input_channels"] < 1:
+                continue
+            nl = d["name"].lower()
+            if any(kw in nl for kw in _high) and _api_label(d["hostapi"]) == _pref_api:
+                input_id = i
+                break
 
+    # Pass 2: any-API high-priority loopback
     if input_id is None:
         for i, d in enumerate(devices):
             if d["max_input_channels"] < 1:
                 continue
             nl = d["name"].lower()
-            if any(kw in nl for kw in _med) and input_id is None:
+            if any(kw in nl for kw in _high):
                 input_id = i
-            if any(kw in nl for kw in _low) and input_id is None:
-                input_id = i
+                break
 
-    # Default input if nothing found
+    # Pass 3: medium-priority (Stereo Mix etc.)
+    if input_id is None:
+        for i, d in enumerate(devices):
+            if d["max_input_channels"] < 1:
+                continue
+            nl = d["name"].lower()
+            if any(kw in nl for kw in _med):
+                input_id = i
+                break
+
+    # Pass 4: low-priority (any "loopback" device)
+    if input_id is None:
+        for i, d in enumerate(devices):
+            if d["max_input_channels"] < 1:
+                continue
+            if any(kw in d["name"].lower() for kw in _low):
+                input_id = i
+                break
+
+    # Pass 5: system default
     if input_id is None:
         try:
             input_id = sd.default.device[0]
         except Exception:
             input_id = None
 
-    # Default output
+    # Output: system default (usually the preferred API speaker on modern OSes)
     try:
         output_id = sd.default.device[1]
     except Exception:
