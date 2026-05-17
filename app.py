@@ -311,10 +311,14 @@ class ModAudioApp(ctk.CTk):
     # =======================================================================
 
     # Keywords that identify system-audio loopback / capture sources.
-    # Covers Windows (Stereo Mix, VB-Cable) and macOS (BlackHole, Soundflower, VB-Cable).
-    _LOOPBACK_KW = ("stereo mix", "what u hear", "wave out mix",
-                    "loopback", "cable output", "vb-audio",
-                    "blackhole", "soundflower", "vb-cable")
+    # Covers Windows (Stereo Mix, VB-Cable, VoiceMeeter Output)
+    # and macOS (BlackHole, Soundflower, VB-Cable).
+    _LOOPBACK_KW = (
+        "stereo mix", "what u hear", "wave out mix",
+        "loopback", "cable output", "vb-audio",
+        "blackhole", "soundflower", "vb-cable",
+        "voicemeeter output",          # VoiceMeeter B1/B2 — system audio capture
+    )
 
     def _dev_hostapi(self, device_idx: int) -> int:
         """Return the host-API index for a given device index."""
@@ -352,41 +356,53 @@ class ModAudioApp(ctk.CTk):
 
     def _build_device_lists(self):
         """
-        Input list  – loopback / system-capture sources first (marked ★),
-                      followed by all other inputs (mic, line-in, etc.).
-                      ★ devices are recommended because they capture what the
-                      system is already playing, so the DSP processes real
-                      audio rather than microphone input.
-        Out list    – rebuilt by _compatible_outputs(), always shows the
-                      best-quality outputs (WASAPI/CoreAudio) independently
-                      of which input is selected.
+        Input list  – ONLY loopback / system-audio capture sources.
+                      Theater mode captures what the system is already playing,
+                      so only devices that tap system audio are relevant here.
+                      Microphones, line-in, and other real-input devices are
+                      excluded — they would send raw mic audio through the
+                      theater DSP rather than system audio.
+                      Preferred API (WASAPI/CoreAudio) listed first.
+        Out list    – rebuilt by _compatible_outputs(); physical playback devices only.
         Each entry is (device_idx, display_name).
         """
-        loopback_devs = []
-        other_devs    = []
-        seen = set()
+        pref = self._preferred_api_label()
+        pref_loopback  = []
+        other_loopback = []
         for i, d in enumerate(self._devs):
             if d["max_input_channels"] < 1:
                 continue
             nl  = d["name"].lower()
             tag = self._hostapi_label(d["hostapi"])
             if any(kw in nl for kw in self._LOOPBACK_KW):
-                label = f"★ {d['name'][:42]}  [{tag}]"   # ★ prefix
-                loopback_devs.append((i, label))
-                seen.add(i)
-            else:
                 label = f"{d['name'][:44]}  [{tag}]"
-                other_devs.append((i, label))
-                seen.add(i)
+                if tag == pref:
+                    pref_loopback.append((i, label))
+                else:
+                    other_loopback.append((i, label))
 
-        # Loopback/system-audio sources first (strongly preferred for Theater mode)
-        self._in_list = loopback_devs + other_devs
-        if not self._in_list:
-            self._in_list = [(0, "Default Input")]
+        # Preferred-API sources first (lowest latency, best duplex compatibility)
+        self._in_list = pref_loopback + other_loopback
+        # Empty list is intentional — UI shows a warning when no loopback exists
+
+    # Virtual loopback sinks and virtual mixer inputs — valid output devices for
+    # routing audio between apps, but NOT physical playback devices.
+    # Excluded from the Theater Speaker dropdown so users always pick a real
+    # speaker or headphone, not an audio pipe that routes elsewhere.
+    _VIRTUAL_SINK_KW = (
+        "cable input",           # VB-Cable Input, Virtual Cable Input
+        "modaudio surround",     # ModAudio's own virtual driver
+        "virtual audio driver",  # generic virtual audio drivers
+        "voicemeeter input",     # VoiceMeeter A1/A2/A3 virtual inputs
+    )
+
+    def _is_virtual_sink(self, device_name: str) -> bool:
+        nl = device_name.lower()
+        return any(kw in nl for kw in self._VIRTUAL_SINK_KW)
 
     def _compatible_outputs(self, input_dev_idx: int) -> list:
         """
-        Return output devices for the Theater single-speaker tab.
+        Return physical output devices for the Theater single-speaker tab.
 
         Always returns the platform's best-quality outputs (WASAPI on Windows,
         CoreAudio on macOS) regardless of the input device's host API.  This
@@ -394,11 +410,16 @@ class ModAudioApp(ctk.CTk):
         MME device (e.g. Stereo Mix [MME]).  A cross-API duplex stream is
         attempted at start time; if it fails, separate input/output streams
         are used automatically.
+
+        Virtual loopback sinks (VB-Cable Input, ModAudio Surround, etc.) are
+        excluded — they are audio routing pipes, not playback devices.
         """
         pref = self._preferred_api_label()
         pref_outs = []
         for i, d in enumerate(self._devs):
             if d["max_output_channels"] < 1:
+                continue
+            if self._is_virtual_sink(d["name"]):
                 continue
             if self._hostapi_label(d["hostapi"]) == pref:
                 tag   = self._hostapi_label(d["hostapi"])
@@ -407,10 +428,10 @@ class ModAudioApp(ctk.CTk):
         if pref_outs:
             return pref_outs
 
-        # Fallback: all output devices (any API)
+        # Fallback: all output devices (any API), still excluding virtual sinks
         out = []
         for i, d in enumerate(self._devs):
-            if d["max_output_channels"] >= 1:
+            if d["max_output_channels"] >= 1 and not self._is_virtual_sink(d["name"]):
                 tag   = self._hostapi_label(d["hostapi"])
                 label = f"{d['name'][:44]}  [{tag}]"
                 out.append((i, label))
@@ -597,13 +618,22 @@ class ModAudioApp(ctk.CTk):
         # Row 1: hint for audio in
         # Row 2: Speaker label + dropdown
         # Row 3: hint for speaker
+        _has_loopback = len(self._in_list) > 0
+        _in_hint = (
+            "Captures system audio — select Stereo Mix, VB-Cable Output, or BlackHole"
+            if _has_loopback else
+            "⚠  No system-audio capture source found — enable Stereo Mix in Sound "
+            "Settings (Recording tab) or install VB-Cable to capture system audio"
+        )
+        _in_hint_color = C["dim"] if _has_loopback else C["warn"]
         rows = [
             ("Audio In",  self._in_list,  "_in_dev_menu",  "_in_dev_idx",
-             "★ = system audio loopback (recommended)  ·  others = mic/line-in"),
+             _in_hint, _in_hint_color),
             ("Speaker",   self._out_list, "_out_dev_menu", "_out_dev_idx",
-             "Processed audio plays here — pick your speaker or headphones"),
+             "Processed audio plays here — pick your speaker or headphones",
+             C["dim"]),
         ]
-        for r, (label, dev_list, attr_menu, attr_idx, hint_txt) in enumerate(rows):
+        for r, (label, dev_list, attr_menu, attr_idx, hint_txt, hint_color) in enumerate(rows):
             grid_row   = r * 2
             hint_row   = r * 2 + 1
             top_pad    = 10 if r == 0 else 6
@@ -640,7 +670,7 @@ class ModAudioApp(ctk.CTk):
             ctk.CTkLabel(
                 f, text=hint_txt,
                 font=ctk.CTkFont(size=9),
-                text_color=C["dim"],
+                text_color=hint_color,
                 anchor="w",
             ).grid(row=hint_row, column=0, columnspan=2, padx=14,
                    pady=(1, 4 if r == 1 else 0), sticky="ew")
@@ -2611,16 +2641,23 @@ class ModAudioApp(ctk.CTk):
         self._schedule_rebuild()
 
     def _on_device_change(self, display_name, attr_menu):
-        """Map display name back to device index; refresh outputs when input changes."""
+        """Map display name back to device index; refresh outputs when input changes.
+        If the stream is currently running, restart it so the new device takes effect
+        immediately without requiring a manual stop/start cycle.
+        """
         lst      = self._in_list if attr_menu == "_in_dev_menu" else self._out_list
         idx_attr = "_in_dev_idx" if attr_menu == "_in_dev_menu" else "_out_dev_idx"
         for dev_idx, dev_name in lst:
             if dev_name == display_name:
                 setattr(self, idx_attr, dev_idx)
                 break
-        # When input changes, rebuild output list to match its host API
+        # When input changes, rebuild the compatible-output list
         if attr_menu == "_in_dev_menu":
             self._refresh_out_menu()
+        # Hot-swap: restart stream with the new device if already running
+        if self._running:
+            self._stop()
+            self._start()
 
     if _IS_WIN:
         _MS_MODE_DESCS = {
@@ -2874,9 +2911,10 @@ class ModAudioApp(ctk.CTk):
 
     def _build_preset(self) -> dict:
         """Merge active preset + slider overrides + mode into a final preset dict."""
-        # Surround modes use headphones base (detailed HRTF-oriented settings).
-        # Mono surround uses speakers base (physical playback oriented).
-        use_hp = self._mode in ("headphones", "surround")
+        # headphones / surround / surround_mono all use HRTF rendering and need
+        # the speaker azimuth positions from HEADPHONES_PRESET.
+        # speakers uses SPEAKERS_PRESET (no HRTF; M/S widening + Haas depth).
+        use_hp = self._mode in ("headphones", "surround", "surround_mono")
         base = dict(HEADPHONES_PRESET if use_hp else SPEAKERS_PRESET)
         base["mode"] = self._mode
         base.update(self._slider_vals)
