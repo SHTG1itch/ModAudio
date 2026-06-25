@@ -208,16 +208,20 @@ class StereoWidenerProcessor:
         x = mid.astype(np.float64)
         w_idx = np.arange(ptr, ptr + n, dtype=np.int64) % bsize
         buf[w_idx] = x
-        # Delay the right channel to create depth.
         # [ptr-d, ptr-d+n) realizes exactly d samples; the old [ptr-d-n, ptr-d)
         # added a block and (with bsize=d+1) wrapped to ~one block of delay.
         d = self._haas_delay
         r_idx = np.arange(ptr - d, ptr - d + n, dtype=np.int64) % bsize
-        delayed_R = buf[r_idx, 1]
+        delayed = buf[r_idx]                     # both channels, delayed
         self._haas_ptr = int((ptr + n) % bsize)
 
-        out = x.copy()
-        out[:, 1] = (x[:, 1] + 0.4 * delayed_R) / 1.4   # blend delayed
+        # Symmetric cross-channel Haas: each output blends in a delayed copy of
+        # the OPPOSITE channel for depth/width.  Delaying only the right channel
+        # (the previous behaviour) comb-filtered just that channel and pulled
+        # the whole image ~0.7 dB to the left; the symmetric form is balanced.
+        out = np.empty_like(x)
+        out[:, 0] = (x[:, 0] + 0.4 * delayed[:, 1]) / 1.4
+        out[:, 1] = (x[:, 1] + 0.4 * delayed[:, 0]) / 1.4
         return out
 
     def process(self, stereo):
