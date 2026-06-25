@@ -20,10 +20,14 @@ except ImportError:
 
 import sounddevice as sd
 
+import json
+
 from config      import HEADPHONES_PRESET, SPEAKERS_PRESET, SAMPLE_RATE, BLOCK_SIZE
 from audio_io    import find_default_devices
-from dsp         import TheaterChain
+from dsp         import TheaterChain, ParametricEQ
+from dsp.speaker_profiles import detect_speaker_profile
 from audio_multi import MultiDeviceStream, MultiSpeakerStreamN, is_bluetooth_device
+from eq_editor   import EQEditorDialog
 from room_canvas_3d import Room3DCanvas, SPEAKER_LAYOUTS_3D, CHANNEL_DIRECTIONS, DIRECTION_TO_SPEAKER
 try:
     import virtual_device as _vdev
@@ -114,6 +118,10 @@ C = {
     "surface2":  "#111113",  # deeper surface for window bg
     "dim":       "#8E8E93",  # systemGray
     "text":      "#F5F5F7",  # Apple-website near-white
+    # Hover states (lighter accent / deeper success) — keep all hover colors
+    # derived from the base palette so interactive states feel consistent.
+    "accent_hover":  "#3B9CFF",
+    "success_hover": "#28C150",
 }
 
 # Corner radius — squircle-adjacent. tkinter can't render true squircles,
@@ -217,6 +225,20 @@ class ModAudioApp(ctk.CTk):
         self._ms_rear_az_deg    = 150.0         # rear speaker azimuth (90–170°)
         self._ms_acoustic_delay = 0.0           # speaker distance delay (ms)
 
+        # ---- Custom EQ state -----------------------------------------------
+        # Theater mode: one global EQ (applied on top of any preset)
+        self._theater_eq = ParametricEQ(fs=SAMPLE_RATE)
+        # Multi-speaker mode: per-speaker EQ keyed by speaker sid
+        self._ms_speaker_eqs: dict[int, ParametricEQ] = {}
+        # EQ editor window reference (prevent duplicate windows)
+        self._eq_editor: EQEditorDialog | None = None
+        # Persistence file
+        self._eq_state_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "eq_state.json")
+        # Persisted speaker EQs keyed by label — populated by _load_eq_state()
+        # Must be initialized here so _restore_speaker_eq() works during _build_ui()
+        self._saved_speaker_eqs: dict = {}
+
         # N-speaker room canvas state
         # Each entry: {sid, label, device_idx, device_label, azimuth, distance}
         self._ms_speakers: list[dict] = []
@@ -303,6 +325,7 @@ class ModAudioApp(ctk.CTk):
 
         # -- Build and start
         self._build_ui()
+        self._load_eq_state()
         self._apply_preset("Cinema", animate=False)
         self._tick_meters()
 
@@ -470,7 +493,7 @@ class ModAudioApp(ctk.CTk):
             fg_color="transparent",
             segmented_button_fg_color=C["surface"],
             segmented_button_selected_color=C["accent"],
-            segmented_button_selected_hover_color="#5a73f5",
+            segmented_button_selected_hover_color="#3B9CFF",
             segmented_button_unselected_color=C["surface"],
             segmented_button_unselected_hover_color=C["surface2"],
             text_color=C["text"],
@@ -498,6 +521,7 @@ class ModAudioApp(ctk.CTk):
         self._build_meters(pad)
         self._build_section("FINE TUNE", pad)
         self._build_sliders(pad)
+        self._build_eq_button_theater(pad)
         self._build_section("VOLUME", pad)
         self._build_volume(pad)
         self._build_transport(pad)
@@ -518,8 +542,12 @@ class ModAudioApp(ctk.CTk):
     def _build_header(self, parent, pad):
         f = ctk.CTkFrame(parent, fg_color=C["surface2"], corner_radius=0,
                          height=68)
-        f.pack(fill="x", padx=0, pady=(0, 2))
+        f.pack(fill="x", padx=0, pady=(0, 0))
         f.pack_propagate(False)
+
+        # Hairline separator under the header (replaces the bare 2px gap)
+        ctk.CTkFrame(parent, fg_color="#2C2C2E", height=1,
+                     corner_radius=0).pack(fill="x", pady=(0, 2))
 
         ctk.CTkLabel(
             f, text="ModAudio",
@@ -535,7 +563,7 @@ class ModAudioApp(ctk.CTk):
 
         # Status badge (right side)
         self._status_badge = ctk.CTkLabel(
-            f, text="  STOPPED",
+            f, text="●  STOPPED",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=C["danger"],
             fg_color=C["surface"],
@@ -547,12 +575,15 @@ class ModAudioApp(ctk.CTk):
     # -- Section label -------------------------------------------------------
 
     def _build_section(self, title, pad, parent=None):
+        # Letter-spaced section caption (tk has no tracking — spaced chars
+        # approximate the small-caps section headers of macOS settings panes)
+        spaced = " ".join(title)
         ctk.CTkLabel(
             parent if parent is not None else self._root_frame,
-            text=title,
-            font=ctk.CTkFont(size=9, weight="bold"),
+            text=spaced,
+            font=ctk.CTkFont(size=10, weight="bold"),
             text_color=C["dim"],
-        ).pack(anchor="w", padx=pad + 2, pady=(12, 2))
+        ).pack(anchor="w", padx=pad + 2, pady=(16, 4))
 
     # -- Presets -------------------------------------------------------------
 
@@ -567,9 +598,9 @@ class ModAudioApp(ctk.CTk):
                 f,
                 text=name,
                 font=ctk.CTkFont(size=13),
-                fg_color=C["accent"],
-                hover_color="#5a73f5",
-                text_color="white",
+                fg_color=C["surface"],
+                hover_color="#2C2C2E",
+                text_color=C["text"],
                 corner_radius=12,
                 height=36,
                 command=lambda n=name: self._apply_preset(n),
@@ -590,7 +621,7 @@ class ModAudioApp(ctk.CTk):
             font=ctk.CTkFont(size=12),
             height=36,
             selected_color=C["accent"],
-            selected_hover_color="#5a73f5",
+            selected_hover_color="#3B9CFF",
             corner_radius=12,
             command=self._on_mode_change,
         )
@@ -601,11 +632,11 @@ class ModAudioApp(ctk.CTk):
         self._mode_desc = ctk.CTkLabel(
             f,
             text="Binaural 5.1 HRTF — optimised for headphones",
-            font=ctk.CTkFont(size=10),
+            font=ctk.CTkFont(size=11),
             text_color=C["dim"],
             anchor="w",
         )
-        self._mode_desc.pack(fill="x", padx=2, pady=(4, 0))
+        self._mode_desc.pack(fill="x", padx=4, pady=(6, 0))
 
     # -- Devices -------------------------------------------------------------
 
@@ -656,7 +687,7 @@ class ModAudioApp(ctk.CTk):
                 font=ctk.CTkFont(size=11),
                 fg_color=C["surface2"],
                 button_color=C["accent"],
-                button_hover_color="#5a73f5",
+                button_hover_color="#3B9CFF",
                 dropdown_fg_color=C["surface2"],
                 dropdown_hover_color=C["surface"],
                 corner_radius=12,
@@ -669,7 +700,7 @@ class ModAudioApp(ctk.CTk):
 
             ctk.CTkLabel(
                 f, text=hint_txt,
-                font=ctk.CTkFont(size=9),
+                font=ctk.CTkFont(size=10),
                 text_color=hint_color,
                 anchor="w",
             ).grid(row=hint_row, column=0, columnspan=2, padx=14,
@@ -741,7 +772,7 @@ class ModAudioApp(ctk.CTk):
                 f, from_=lo, to=hi,
                 height=16,
                 button_color=C["accent"],
-                button_hover_color="#5a73f5",
+                button_hover_color="#3B9CFF",
                 progress_color=C["accent"],
                 fg_color=C["surface2"],
                 corner_radius=4,
@@ -779,7 +810,7 @@ class ModAudioApp(ctk.CTk):
         self._vol_slider = ctk.CTkSlider(
             f, from_=-30.0, to=6.0,
             height=16,
-            button_color=C["accent"], button_hover_color="#5a73f5",
+            button_color=C["accent"], button_hover_color="#3B9CFF",
             progress_color=C["accent"], fg_color=C["surface2"], corner_radius=4,
             command=self._on_volume_change,
         )
@@ -804,7 +835,7 @@ class ModAudioApp(ctk.CTk):
             text="   START",
             font=ctk.CTkFont(size=20, weight="bold"),
             fg_color=C["success"],
-            hover_color="#08f0b0",
+            hover_color="#28C150",
             text_color="#0d1117",
             corner_radius=18,
             height=62,
@@ -918,7 +949,7 @@ class ModAudioApp(ctk.CTk):
         self._ms_btn_install_driver = ctk.CTkButton(
             f_vbtn, text="Install Virtual Speaker",
             font=ctk.CTkFont(size=11, weight="bold"),
-            fg_color=C["accent"], hover_color="#5a73f5",
+            fg_color=C["accent"], hover_color="#3B9CFF",
             text_color="white", corner_radius=12, height=32,
             command=self._on_ms_install_driver,
         )
@@ -957,7 +988,7 @@ class ModAudioApp(ctk.CTk):
         self._ms_btn_autoconfigure = ctk.CTkButton(
             f_vs, text="▶  Auto-Configure Full Control (Both Speakers)",
             font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color=C["success"], hover_color="#08f0b0",
+            fg_color=C["success"], hover_color="#28C150",
             text_color="#0d1117", corner_radius=12, height=36,
             command=self._on_ms_autoconfigure,
         )
@@ -979,7 +1010,7 @@ class ModAudioApp(ctk.CTk):
             font=ctk.CTkFont(size=12),
             height=36,
             selected_color=C["accent"],
-            selected_hover_color="#5a73f5",
+            selected_hover_color="#3B9CFF",
             corner_radius=12,
             command=self._on_ms_mode_change,
         )
@@ -1015,7 +1046,7 @@ class ModAudioApp(ctk.CTk):
                 f_tm, text=nm,
                 font=ctk.CTkFont(size=11, weight="bold" if is_sel else "normal"),
                 fg_color=C["accent"] if is_sel else C["surface2"],
-                hover_color="#5a73f5",
+                hover_color="#3B9CFF",
                 border_color=C["accent"],
                 border_width=1 if not is_sel else 0,
                 text_color="white" if is_sel else C["text"],
@@ -1056,7 +1087,7 @@ class ModAudioApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             fg_color=C["surface2"],
             button_color=C["accent"],
-            button_hover_color="#5a73f5",
+            button_hover_color="#3B9CFF",
             dropdown_fg_color=C["surface2"],
             dropdown_hover_color=C["surface"],
             corner_radius=12, height=32,
@@ -1111,7 +1142,7 @@ class ModAudioApp(ctk.CTk):
             f_add_out, text="+ Add Device",
             font=ctk.CTkFont(size=10, weight="bold"),
             height=26, width=110,
-            fg_color=C["accent"], hover_color="#5a73f5",
+            fg_color=C["accent"], hover_color="#3B9CFF",
             text_color="white", corner_radius=6,
             command=self._ms_add_output_row,
         ).pack(side="left")
@@ -1161,7 +1192,7 @@ class ModAudioApp(ctk.CTk):
 
         self._ms_bt_slider = ctk.CTkSlider(
             f_sl_row, from_=0.0, to=300.0, height=16,
-            button_color=C["accent"], button_hover_color="#5a73f5",
+            button_color=C["accent"], button_hover_color="#3B9CFF",
             progress_color=C["accent"], fg_color=C["surface2"], corner_radius=4,
             command=self._on_ms_bt_slider,
         )
@@ -1278,7 +1309,7 @@ class ModAudioApp(ctk.CTk):
             short = lname.replace(" Cinema", "").replace(" Dolby", "")
             btn = ctk.CTkButton(
                 f_room_ctrl, text=short,
-                font=ctk.CTkFont(size=9),
+                font=ctk.CTkFont(size=10),
                 height=26, width=70,
                 fg_color=C["surface2"], hover_color=C["surface"],
                 border_color=C["dim"], border_width=1,
@@ -1290,9 +1321,9 @@ class ModAudioApp(ctk.CTk):
         # Add-speaker button (after layout presets)
         ctk.CTkButton(
             f_room_ctrl, text="+ Add",
-            font=ctk.CTkFont(size=9, weight="bold"),
+            font=ctk.CTkFont(size=10, weight="bold"),
             height=26, width=52,
-            fg_color=C["accent"], hover_color="#5a73f5",
+            fg_color=C["accent"], hover_color="#3B9CFF",
             text_color="white", corner_radius=5,
             command=self._on_ms_add_speaker,
         ).grid(row=1, column=len(_layout_names), padx=(4, 2), pady=(2, 0))
@@ -1323,7 +1354,7 @@ class ModAudioApp(ctk.CTk):
             values=names_all if names_all else ["No output devices"],
             font=ctk.CTkFont(size=10),
             fg_color=C["surface2"],
-            button_color=C["accent"], button_hover_color="#5a73f5",
+            button_color=C["accent"], button_hover_color="#3B9CFF",
             dropdown_fg_color=C["surface2"], dropdown_hover_color=C["surface"],
             corner_radius=12, height=30,
             command=self._on_ms_spk_dev_change,
@@ -1351,7 +1382,7 @@ class ModAudioApp(ctk.CTk):
             self._ms_spk_panel, from_=0, to=360, number_of_steps=72,
             height=20,
             fg_color=C["surface2"], progress_color=C["accent"],
-            button_color=C["accent"], button_hover_color="#5a73f5",
+            button_color=C["accent"], button_hover_color="#3B9CFF",
             command=self._on_ms_face_slider_change,
         )
         self._ms_face_az_slider.set(0)
@@ -1373,7 +1404,7 @@ class ModAudioApp(ctk.CTk):
             self._ms_spk_panel, from_=-90, to=90, number_of_steps=36,
             height=20,
             fg_color=C["surface2"], progress_color=C["accent"],
-            button_color=C["accent"], button_hover_color="#5a73f5",
+            button_color=C["accent"], button_hover_color="#3B9CFF",
             command=self._on_ms_face_slider_change,
         )
         self._ms_face_el_slider.set(0)
@@ -1391,7 +1422,7 @@ class ModAudioApp(ctk.CTk):
             self._ms_spk_panel,
             text="Drag dots to reposition  ·  Shift-drag to adjust height  ·  "
                  "Right-click for orientation presets  ·  Use sliders above for precise rotation",
-            font=ctk.CTkFont(size=9), text_color=C["dim"],
+            font=ctk.CTkFont(size=10), text_color=C["dim"],
             anchor="w", wraplength=600,
         ).grid(row=4, column=0, columnspan=4, padx=14, pady=(0, 8), sticky="ew")
 
@@ -1480,7 +1511,7 @@ class ModAudioApp(ctk.CTk):
             sl = ctk.CTkSlider(
                 f_met, from_=-30.0, to=6.0,
                 height=16,
-                button_color=C["accent"], button_hover_color="#5a73f5",
+                button_color=C["accent"], button_hover_color="#3B9CFF",
                 progress_color=C["accent"], fg_color=C["surface2"], corner_radius=4,
                 command=cb,
             )
@@ -1498,6 +1529,32 @@ class ModAudioApp(ctk.CTk):
 
         ctk.CTkLabel(f_met, text="", height=6).grid(row=7, column=0)
 
+        # --- CUSTOM EQ -------------------------------------------------------
+        self._build_section("CUSTOM EQ", pad, parent=ms)
+        f_eq_ms = ctk.CTkFrame(ms, fg_color=C["surface"], corner_radius=16)
+        f_eq_ms.pack(fill="x", padx=pad, pady=(0, 4))
+
+        ctk.CTkLabel(
+            f_eq_ms,
+            text="Per-speaker parametric EQ on top of the theater mode. "
+                 "Each speaker can have an independent curve based on its capabilities.",
+            font=ctk.CTkFont(size=10),
+            text_color=C["dim"],
+            anchor="w", justify="left", wraplength=480,
+        ).pack(fill="x", padx=14, pady=(10, 4))
+
+        self._ms_eq_btn = ctk.CTkButton(
+            f_eq_ms,
+            text="Open EQ Editor  ▸",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color=C["accent"],
+            hover_color="#3B9CFF",
+            text_color="white",
+            corner_radius=12, height=38,
+            command=self._open_ms_eq,
+        )
+        self._ms_eq_btn.pack(fill="x", padx=14, pady=(0, 12))
+
         # --- TRANSPORT -------------------------------------------------------
         f_ms_trans = ctk.CTkFrame(ms, fg_color="transparent")
         f_ms_trans.pack(fill="x", padx=pad, pady=(10, 4))
@@ -1507,7 +1564,7 @@ class ModAudioApp(ctk.CTk):
             text="   START MULTI-SPEAKER",
             font=ctk.CTkFont(size=16, weight="bold"),
             fg_color=C["success"],
-            hover_color="#08f0b0",
+            hover_color="#28C150",
             text_color="#0d1117",
             corner_radius=18, height=54,
             command=self._toggle_multi,
@@ -1621,6 +1678,7 @@ class ModAudioApp(ctk.CTk):
                     "face_az":      cs.face_az,
                     "face_el":      cs.face_el,
                 })
+                self._restore_speaker_eq(cs.sid, cs.label)
         # Remove speakers that no longer exist in canvas
         canvas_sids = {cs.sid for cs in canvas_spks}
         self._ms_speakers = [s for s in self._ms_speakers
@@ -1652,22 +1710,12 @@ class ModAudioApp(ctk.CTk):
                     device_label = row["dev_name"][:20]
                     break
 
-            sid = self._room_canvas.add_speaker(
+            self._room_canvas.add_speaker(
                 label, az, el, dist,
                 device_idx=device_idx,
                 device_label=device_label,
             )
-            self._ms_speakers.append({
-                "sid":          sid,
-                "label":        label,
-                "azimuth":      az,
-                "elevation":    el,
-                "distance":     dist,
-                "device_idx":   device_idx,
-                "device_label": device_label,
-                "face_az":      (az + 180.0) % 360.0,
-                "face_el":      -el,
-            })
+            # _on_ms_canvas_change fires inside add_speaker and handles the append
         # Initialise per-speaker smoothing buffers
         self._ms_dsp_per_spk = {s["sid"]: np.zeros(2, dtype=np.float32)
                                  for s in self._ms_speakers}
@@ -1683,12 +1731,7 @@ class ModAudioApp(ctk.CTk):
         el  = 0.0
         lbl = f"S{n + 1}"
         sid = self._room_canvas.add_speaker(lbl, az, el, 2.5)
-        self._ms_speakers.append({
-            "sid": sid, "label": lbl,
-            "azimuth": az, "elevation": el, "distance": 2.5,
-            "device_idx": None, "device_label": "Unassigned",
-            "face_az": (az + 180.0) % 360.0, "face_el": 0.0,
-        })
+        # _on_ms_canvas_change fires inside add_speaker and handles the append + EQ restore
         self._ms_dsp_per_spk[sid] = np.zeros(2, dtype=np.float32)
         # Select the new speaker
         self._room_canvas.set_selected_sid(sid)
@@ -1770,9 +1813,15 @@ class ModAudioApp(ctk.CTk):
         elevations = [s.get("elevation", 0.0)                   for s in self._ms_speakers]
         face_azs   = [s.get("face_az", (s["azimuth"]+180.0)%360.0) for s in self._ms_speakers]
         face_els   = [s.get("face_el", 0.0)                     for s in self._ms_speakers]
+        distances  = [s.get("distance", 2.0)                    for s in self._ms_speakers]
 
         if hasattr(self._ms_stream, "update_speakers"):
-            self._ms_stream.update_speakers(azimuths, elevations, face_azs, face_els)
+            try:
+                self._ms_stream.update_speakers(
+                    azimuths, elevations, face_azs, face_els, distances)
+            except TypeError:
+                # Older stream signature without distance support
+                self._ms_stream.update_speakers(azimuths, elevations, face_azs, face_els)
         elif hasattr(self._ms_stream, "update_speaker_azimuths"):
             self._ms_stream.update_speaker_azimuths(azimuths)
         elif hasattr(self._ms_stream, "update_rear_az") and len(azimuths) >= 2:
@@ -1825,7 +1874,7 @@ class ModAudioApp(ctk.CTk):
             values=names_all if names_all else ["No output devices"],
             font=ctk.CTkFont(size=11),
             fg_color=C["surface2"],
-            button_color=C["accent"], button_hover_color="#5a73f5",
+            button_color=C["accent"], button_hover_color="#3B9CFF",
             dropdown_fg_color=C["surface2"], dropdown_hover_color=C["surface"],
             corner_radius=12, height=30,
         )
@@ -1837,7 +1886,7 @@ class ModAudioApp(ctk.CTk):
             values=CHANNEL_DIRECTIONS,
             font=ctk.CTkFont(size=10),
             fg_color=C["surface2"],
-            button_color=C["accent"], button_hover_color="#5a73f5",
+            button_color=C["accent"], button_hover_color="#3B9CFF",
             dropdown_fg_color=C["surface2"], dropdown_hover_color=C["surface"],
             corner_radius=12, height=30, width=148,
         )
@@ -2254,7 +2303,7 @@ class ModAudioApp(ctk.CTk):
                 self._ms_btn_install_driver.configure(
                     state="normal",
                     text="Install Virtual Speaker",
-                    fg_color=C["accent"], hover_color="#5a73f5",
+                    fg_color=C["accent"], hover_color="#3B9CFF",
                     border_width=0, text_color="white",
                 )
 
@@ -2601,11 +2650,13 @@ class ModAudioApp(ctk.CTk):
                 fmt = next(fn for lbl, k, lo, hi, fn in SLIDERS if k == key)
                 self._slider_var_lbls[key].configure(text=fmt(params[key]))
 
-        # Highlight active preset button
+        # Highlight active preset button (quiet pills, accent = selected)
         for n, btn in self._preset_btns.items():
+            sel = (n == name)
             btn.configure(
-                fg_color=C["accent"] if n != name else C["success"],
-                text_color="white" if n != name else "#0d1117",
+                fg_color=C["accent"] if sel else C["surface"],
+                hover_color=C["accent_hover"] if sel else "#2C2C2E",
+                text_color="white" if sel else C["text"],
             )
 
         self._schedule_rebuild()
@@ -2615,7 +2666,8 @@ class ModAudioApp(ctk.CTk):
         self._slider_var_lbls[key].configure(text=fmt(value))
         # Deselect preset buttons (custom config)
         for btn in self._preset_btns.values():
-            btn.configure(fg_color=C["accent"], text_color="white")
+            btn.configure(fg_color=C["surface"], hover_color="#2C2C2E",
+                          text_color=C["text"])
         self._schedule_rebuild()
 
     # Mode label shown under the segmented button
@@ -2859,6 +2911,12 @@ class ModAudioApp(ctk.CTk):
     def _on_volume_change(self, value: float):
         """Theater tab master gain slider callback (dB)."""
         self._master_gain = 10 ** (value / 20.0)
+        # Route the trim through the chain so it is applied *before* the peak
+        # limiter — applying it after would let a volume boost exceed the
+        # ceiling and clip. Hot-set on the live chain (no rebuild needed).
+        chain = self._chain
+        if chain is not None and hasattr(chain, "set_user_trim"):
+            chain.set_user_trim(self._master_gain)
         db_txt = f"{value:+.0f} dB" if value != 0.0 else "0 dB"
         self._vol_lbl.configure(text=db_txt)
 
@@ -2939,7 +2997,12 @@ class ModAudioApp(ctk.CTk):
         """Build a new TheaterChain with current parameters (runs in timer thread)."""
         try:
             preset    = self._build_preset()
-            new_chain = TheaterChain(fs=SAMPLE_RATE, preset=preset)
+            new_chain = TheaterChain(
+                fs=SAMPLE_RATE,
+                preset=preset,
+                custom_eq=self._theater_eq,
+            )
+            new_chain.set_user_trim(self._master_gain)
             self._chain = new_chain   # Python assignment is atomic under GIL
         except Exception as e:
             print(f"[rebuild] {e}")
@@ -2967,7 +3030,9 @@ class ModAudioApp(ctk.CTk):
             self._stop_multi()
 
         preset = self._build_preset()
-        self._chain  = TheaterChain(fs=SAMPLE_RATE, preset=preset)
+        self._chain  = TheaterChain(
+            fs=SAMPLE_RATE, preset=preset, custom_eq=self._theater_eq)
+        self._chain.set_user_trim(self._master_gain)
         self._xruns  = 0
         self._blk_count = 0
         self._t_start   = time.time()
@@ -3041,7 +3106,7 @@ class ModAudioApp(ctk.CTk):
                 sq = block * block
                 self._raw_in = np.sqrt(
                     np.array([sq[:, 0].mean(), sq[:, 1].mean()], dtype=np.float32))
-                result = chain.process(block) * self._master_gain
+                result = chain.process(block)   # user volume is applied inside the chain (pre-limiter)
                 sq2 = result * result
                 self._raw_out = np.sqrt(
                     np.array([sq2[:, 0].mean(), sq2[:, 1].mean()], dtype=np.float32))
@@ -3132,15 +3197,15 @@ class ModAudioApp(ctk.CTk):
                 hover_color="#f56070",
                 text_color="white",
             )
-            self._status_badge.configure(text="  RUNNING", text_color=C["success"])
+            self._status_badge.configure(text="●  RUNNING", text_color=C["success"])
         else:
             self._start_btn.configure(
                 text="   START",
                 fg_color=C["success"],
-                hover_color="#08f0b0",
+                hover_color="#28C150",
                 text_color="#0d1117",
             )
-            self._status_badge.configure(text="  STOPPED", text_color=C["danger"])
+            self._status_badge.configure(text="●  STOPPED", text_color=C["danger"])
             self._lbl_cpu.configure(text="CPU: --", text_color=C["dim"])
 
     # =======================================================================
@@ -3195,6 +3260,14 @@ class ModAudioApp(ctk.CTk):
 
             gains = ([self._ms_front_gain]
                      + [self._ms_rear_gain] * (len(speaker_devs) - 1))
+
+            # Ensure ParametricEQ objects exist for all assigned speakers
+            for spk in assigned:
+                sid = spk["sid"]
+                if sid not in self._ms_speaker_eqs:
+                    self._ms_speaker_eqs[sid] = ParametricEQ(fs=SAMPLE_RATE)
+            speaker_eqs = [self._ms_speaker_eqs.get(s["sid"]) for s in assigned]
+
             try:
                 self._ms_stream = MultiSpeakerStreamN(
                     in_dev=self._ms_in_idx,
@@ -3203,12 +3276,14 @@ class ModAudioApp(ctk.CTk):
                     speaker_elevations=elevations,
                     speaker_face_azs=face_azs,
                     speaker_face_els=face_els,
+                    speaker_distances=[s.get("distance", 2.0) for s in assigned],
                     fs=SAMPLE_RATE,
                     block_size=BLOCK_SIZE,
                     preset=preset,
                     bt_delay_ms=self._ms_bt_delay,
                     gains=gains,
                     bass_priority=self._ms_bass_priority,
+                    speaker_eqs=speaker_eqs,
                 )
                 self._ms_stream.start()
                 self._ms_running = True
@@ -3239,14 +3314,28 @@ class ModAudioApp(ctk.CTk):
 
             front_info = None
             rear_info  = None
+            front_dist = None
+            rear_dist  = None
             if n_spk >= 1 and self._ms_speakers[0]["device_idx"] is not None:
                 front_dev  = self._ms_speakers[0]["device_idx"]
                 front_info = _spk_info(self._ms_speakers[0], 0.0,   180.0)
+                front_dist = float(self._ms_speakers[0].get("distance", 2.0))
             if n_spk >= 2 and self._ms_speakers[1]["device_idx"] is not None:
                 rear_dev   = self._ms_speakers[1]["device_idx"]
                 rear_az    = abs(self._ms_speakers[1]["azimuth"])
                 rear_az    = max(60.0, min(170.0, rear_az))
                 rear_info  = _spk_info(self._ms_speakers[1], rear_az, (rear_az+180.0)%360.0)
+                rear_dist  = float(self._ms_speakers[1].get("distance", 2.0))
+
+            # Ensure per-speaker EQs exist for front/rear
+            for spk in self._ms_speakers[:2]:
+                sid = spk["sid"]
+                if sid not in self._ms_speaker_eqs:
+                    self._ms_speaker_eqs[sid] = ParametricEQ(fs=SAMPLE_RATE)
+            front_eq = (self._ms_speaker_eqs.get(self._ms_speakers[0]["sid"])
+                        if self._ms_speakers else None)
+            rear_eq  = (self._ms_speaker_eqs.get(self._ms_speakers[1]["sid"])
+                        if len(self._ms_speakers) > 1 else None)
 
             try:
                 self._ms_stream = MultiDeviceStream(
@@ -3266,6 +3355,10 @@ class ModAudioApp(ctk.CTk):
                     acoustic_delay_ms=self._ms_acoustic_delay,
                     front_info=front_info,
                     rear_info=rear_info,
+                    front_eq=front_eq,
+                    rear_eq=rear_eq,
+                    front_dist_m=front_dist,
+                    rear_dist_m=rear_dist,
                 )
                 self._ms_stream.start()
                 self._ms_running = True
@@ -3297,17 +3390,17 @@ class ModAudioApp(ctk.CTk):
                 text_color="white",
             )
             self._ms_lbl_status.configure(text="Running", text_color=C["success"])
-            self._status_badge.configure(text="  RUNNING", text_color=C["success"])
+            self._status_badge.configure(text="●  RUNNING", text_color=C["success"])
         else:
             self._ms_start_btn.configure(
                 text="   START MULTI-SPEAKER",
                 fg_color=C["success"],
-                hover_color="#08f0b0",
+                hover_color="#28C150",
                 text_color="#0d1117",
             )
             self._ms_lbl_status.configure(text="Stopped", text_color=C["dim"])
             if not self._running:
-                self._status_badge.configure(text="  STOPPED", text_color=C["danger"])
+                self._status_badge.configure(text="●  STOPPED", text_color=C["danger"])
 
     # =======================================================================
     # Audio callback (runs in sounddevice thread)
@@ -3334,7 +3427,7 @@ class ModAudioApp(ctk.CTk):
             self._raw_in = np.sqrt(np.array([sq[:, 0].mean(), sq[:, 1].mean()],
                                             dtype=np.float32))
 
-            result = chain.process(block) * self._master_gain
+            result = chain.process(block)   # user volume is applied inside the chain (pre-limiter)
 
             # Measure output RMS
             sq2 = result * result
@@ -3378,10 +3471,207 @@ class ModAudioApp(ctk.CTk):
     # =======================================================================
     # Shutdown
     # =======================================================================
+    # EQ integration
+    # =======================================================================
+
+    def _build_eq_button_theater(self, pad):
+        """Add the EQ editor button to the Theater tab (below FINE TUNE sliders)."""
+        f = ctk.CTkFrame(self._root_frame, fg_color=C["surface"], corner_radius=16)
+        f.pack(fill="x", padx=pad, pady=(0, 4))
+
+        ctk.CTkLabel(
+            f,
+            text="Custom EQ on top of the selected theater mode preset. "
+                 "Auto-detected from your output device.",
+            font=ctk.CTkFont(size=10),
+            text_color=C["dim"],
+            anchor="w", justify="left", wraplength=480,
+        ).pack(fill="x", padx=14, pady=(10, 4))
+
+        btn_row = ctk.CTkFrame(f, fg_color="transparent")
+        btn_row.pack(fill="x", padx=14, pady=(0, 12))
+        btn_row.grid_columnconfigure(0, weight=1)
+
+        self._theater_eq_btn = ctk.CTkButton(
+            btn_row,
+            text="Open EQ Editor  ▸",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color=C["accent"],
+            hover_color="#3B9CFF",
+            text_color="white",
+            corner_radius=12, height=38,
+            command=self._open_theater_eq,
+        )
+        self._theater_eq_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        self._theater_eq_status = ctk.CTkLabel(
+            btn_row, text="Flat",
+            font=ctk.CTkFont(size=10),
+            text_color=C["dim"],
+            width=60, anchor="e",
+        )
+        self._theater_eq_status.grid(row=0, column=1)
+
+    def _open_theater_eq(self):
+        """Open the EQ editor for theater mode (single global EQ)."""
+        if self._eq_editor is not None and self._eq_editor.is_open():
+            try:
+                self._eq_editor._win.lift()
+                self._eq_editor._win.focus_force()
+            except Exception:
+                pass
+            return
+
+        # Get current output device name for auto-detection
+        dev_name = ""
+        try:
+            dev_name = self._devs[self._out_dev_idx]["name"]
+        except Exception:
+            pass
+
+        def _on_eq_close():
+            self._update_theater_eq_label()
+
+        self._eq_editor = EQEditorDialog(
+            parent=self,
+            eq=self._theater_eq,
+            mode="theater",
+            output_device_name=dev_name,
+            output_device_idx=self._out_dev_idx if hasattr(self, "_out_dev_idx") else None,
+            on_close=_on_eq_close,
+            fs=SAMPLE_RATE,
+            eq_state_path=self._eq_state_path,
+        )
+
+    def _open_ms_eq(self):
+        """Open the EQ editor for multi-speaker mode (per-speaker EQs)."""
+        if self._eq_editor is not None and self._eq_editor.is_open():
+            try:
+                self._eq_editor._win.lift()
+                self._eq_editor._win.focus_force()
+            except Exception:
+                pass
+            return
+
+        # Build speaker list for the editor
+        spk_list = []
+        for spk in self._ms_speakers:
+            sid = spk["sid"]
+            if sid not in self._ms_speaker_eqs:
+                self._ms_speaker_eqs[sid] = ParametricEQ(fs=SAMPLE_RATE)
+            dev_name = ""
+            try:
+                if spk["device_idx"] is not None:
+                    dev_name = self._devs[spk["device_idx"]]["name"]
+            except Exception:
+                pass
+            spk_list.append({
+                "sid":         sid,
+                "label":       spk["label"],
+                "device_name": dev_name,
+                "device_idx":  spk.get("device_idx"),
+                "eq":          self._ms_speaker_eqs[sid],
+            })
+
+        if not spk_list:
+            # No speakers yet — create a placeholder
+            spk_list = [{
+                "sid": 0, "label": "Speaker 1",
+                "device_name": "", "eq": ParametricEQ(fs=SAMPLE_RATE),
+            }]
+
+        def _on_eq_close():
+            # Push updated EQs to the running stream if active
+            if self._ms_running and self._ms_stream:
+                eqs = [self._ms_speaker_eqs.get(s["sid"]) for s in self._ms_speakers]
+                if hasattr(self._ms_stream, "update_speaker_eqs"):
+                    self._ms_stream.update_speaker_eqs(eqs)
+
+        self._eq_editor = EQEditorDialog(
+            parent=self,
+            eq=spk_list[0]["eq"],
+            mode="multi_speaker",
+            speaker_list=spk_list,
+            on_close=_on_eq_close,
+            fs=SAMPLE_RATE,
+            eq_state_path=self._eq_state_path,
+        )
+
+    def _update_theater_eq_label(self):
+        """Update the status label next to the EQ button."""
+        if not hasattr(self, "_theater_eq_status"):
+            return
+        if self._theater_eq.is_flat():
+            self._theater_eq_status.configure(text="Flat", text_color=C["dim"])
+        else:
+            n_active = sum(
+                1 for p in self._theater_eq.get_band_params()
+                if abs(p["gain_db"]) > 0.1
+            )
+            self._theater_eq_status.configure(
+                text=f"{n_active} active", text_color=C["success"])
+
+    # ------------------------------------------------------------------
+    # EQ persistence
+
+    def _load_eq_state(self):
+        """Load persisted EQ state from eq_state.json."""
+        if not os.path.exists(self._eq_state_path):
+            self._saved_speaker_eqs: dict = {}
+            return
+        try:
+            with open(self._eq_state_path, "r") as f:
+                data = json.load(f)
+            if "theater_eq" in data:
+                self._theater_eq.set_all_bands(data["theater_eq"])
+            # Speaker EQs keyed by label (labels are stable; sids are session-ephemeral)
+            self._saved_speaker_eqs = data.get("speaker_eqs", {})
+        except Exception as e:
+            print(f"[eq] load failed: {e}")
+            self._saved_speaker_eqs = {}
+
+    def _restore_speaker_eq(self, sid: int, label: str) -> None:
+        """Restore persisted EQ for a speaker by label, or create a fresh flat EQ."""
+        if label in self._saved_speaker_eqs:
+            eq = ParametricEQ(fs=SAMPLE_RATE)
+            eq.set_all_bands(self._saved_speaker_eqs[label])
+            self._ms_speaker_eqs[sid] = eq
+        elif sid not in self._ms_speaker_eqs:
+            self._ms_speaker_eqs[sid] = ParametricEQ(fs=SAMPLE_RATE)
+
+    def _save_eq_state(self):
+        """Save EQ state to eq_state.json."""
+        try:
+            data: dict = {}
+            if os.path.exists(self._eq_state_path):
+                with open(self._eq_state_path, "r") as f:
+                    data = json.load(f)
+        except Exception:
+            data = {}
+
+        data["theater_eq"] = self._theater_eq.get_band_params()
+
+        spk_eqs = {}
+        for spk in self._ms_speakers:
+            sid = spk["sid"]
+            if sid in self._ms_speaker_eqs:
+                key = spk.get("label", f"speaker_{sid}")
+                spk_eqs[key] = self._ms_speaker_eqs[sid].get_band_params()
+        if spk_eqs:
+            data["speaker_eqs"] = spk_eqs
+
+        try:
+            with open(self._eq_state_path, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"[eq] save failed: {e}")
+
+    # =======================================================================
 
     def _on_close(self):
         if self._rb_timer:
             self._rb_timer.cancel()
+        self._save_eq_state()
         self._stop()
         self._stop_multi()
         self.destroy()

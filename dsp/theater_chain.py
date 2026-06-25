@@ -68,7 +68,12 @@ class TheaterChain:
     preset : dict - theater preset (default HEADPHONES_PRESET)
     """
 
-    def __init__(self, fs: int = 48000, preset: dict | None = None):
+    def __init__(
+        self,
+        fs: int = 48000,
+        preset: dict | None = None,
+        custom_eq=None,
+    ):
         if preset is None:
             from config import HEADPHONES_PRESET
             preset = HEADPHONES_PRESET
@@ -77,6 +82,15 @@ class TheaterChain:
         self._preset = preset
 
         self._master_gain = 10 ** (preset["output_gain_db"] / 20.0)
+
+        # User volume trim, applied together with the master gain *before* the
+        # limiter so that boosting volume cannot push peaks past the ceiling.
+        self._user_trim = 1.0
+
+        # Optional custom EQ — applied after CinemaEqualizer, before spatialization.
+        # The ParametricEQ object is shared with the UI; setting it here means
+        # it stays active across preset changes without rebuilding the chain.
+        self._custom_eq = custom_eq  # ParametricEQ | None
 
         # -- Harmonic enhancement (pre-EQ) ------------------------------------
         self._bass_enh = HarmonicBassEnhancer(
@@ -134,19 +148,32 @@ class TheaterChain:
         x = self._bass_enh.process(x)   # harmonic bass synthesis
         x = self._air_exc.process(x)    # air-band exciter
         x = self._eq.process(x)         # cinema X-curve EQ
+        if self._custom_eq is not None:
+            x = self._custom_eq.process(x)   # user custom EQ (on top of mode preset)
         x = self._surround.process(x)   # virtual surround / widening
         x = self._reverb.process(x)     # theater room acoustics
         x = self._comp.process(x)       # multi-band compression
         x = self._trans.process(x)      # transient enhancement
-        x = x * self._master_gain       # master trim
-        x = self._limiter.process(x)    # peak limiter
+        x = x * (self._master_gain * self._user_trim)   # master + user trim
+        x = self._limiter.process(x)    # peak limiter (last stage — protects ceiling)
 
         return x
+
+    def set_user_trim(self, gain: float) -> None:
+        """Set the user volume trim (linear). Applied before the limiter so the
+        output ceiling is always respected, even when volume is boosted."""
+        self._user_trim = float(gain)
+
+    def set_custom_eq(self, eq) -> None:
+        """Attach or replace the custom EQ stage.  Pass None to bypass."""
+        self._custom_eq = eq
 
     def reset(self):
         for stage in (self._bass_enh, self._air_exc, self._eq, self._surround,
                       self._reverb, self._comp, self._trans, self._limiter):
             stage.reset()
+        if self._custom_eq is not None:
+            self._custom_eq.reset()
 
     @property
     def fs(self) -> int:
