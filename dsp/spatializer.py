@@ -32,7 +32,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.signal import lfilter, lfilter_zi
 
-from .filters import make_lowpass, make_highpass
+from .filters import make_lr4_lowpass, make_lr4_highpass
 from .hrtf    import BinauralSpeakerRenderer
 
 
@@ -89,10 +89,12 @@ class BinauralSurroundProcessor:
         self._fs  = fs
         self._p   = preset
 
-        self._lp_sub = make_lowpass(self.CROSSOVER_LO, q=0.707, fs=fs, ch=2)
-        self._hp_mid = make_highpass(self.CROSSOVER_LO, q=0.707, fs=fs, ch=2)
-        self._hp_air = make_highpass(self.CROSSOVER_HI, q=0.707, fs=fs, ch=2)
-        self._lp_mid = make_lowpass(self.CROSSOVER_HI, q=0.707, fs=fs, ch=2)
+        # LR4 crossovers: bands recombine flat (Butterworth biquad pairs
+        # would notch the summed output at each crossover frequency)
+        self._lp_sub = make_lr4_lowpass(self.CROSSOVER_LO, fs=fs, ch=2)
+        self._hp_mid = make_lr4_highpass(self.CROSSOVER_LO, fs=fs, ch=2)
+        self._hp_air = make_lr4_highpass(self.CROSSOVER_HI, fs=fs, ch=2)
+        self._lp_mid = make_lr4_lowpass(self.CROSSOVER_HI, fs=fs, ch=2)
 
         self._upmix = _StereoUpmix(fs)
 
@@ -176,10 +178,12 @@ class StereoWidenerProcessor:
         self._fs  = fs
         self._p   = preset
 
-        self._lp_sub = make_lowpass(self.CROSSOVER_LO, q=0.707, fs=fs, ch=2)
-        self._hp_mid = make_highpass(self.CROSSOVER_LO, q=0.707, fs=fs, ch=2)
-        self._hp_air = make_highpass(self.CROSSOVER_HI, q=0.707, fs=fs, ch=2)
-        self._lp_mid = make_lowpass(self.CROSSOVER_HI, q=0.707, fs=fs, ch=2)
+        # LR4 crossovers: the three bands are summed at the output and
+        # LR4 LP/HP pairs recombine flat
+        self._lp_sub = make_lr4_lowpass(self.CROSSOVER_LO, fs=fs, ch=2)
+        self._hp_mid = make_lr4_highpass(self.CROSSOVER_LO, fs=fs, ch=2)
+        self._hp_air = make_lr4_highpass(self.CROSSOVER_HI, fs=fs, ch=2)
+        self._lp_mid = make_lr4_lowpass(self.CROSSOVER_HI, fs=fs, ch=2)
 
         self._width     = preset["stereo_width"]
         self._lfe_level = preset["lfe_level"]
@@ -232,7 +236,14 @@ class StereoWidenerProcessor:
         air_w = np.stack([air_M + self._air_width * air_S,
                           air_M - self._air_width * air_S], axis=1)
 
-        out = (sub_stereo + mid_w + air_w) / 3.0
+        # The three bands are complementary LR4 splits of the input, so they
+        # already sum back to ~unity magnitude (an LR4 LP/HP pair reconstructs
+        # flat).  Dividing the sum by 3 — as if they were three redundant
+        # full-range copies — attenuated the whole output by ~9.5 dB, which
+        # starved every downstream stage and made speaker mode far too quiet.
+        # Sum them directly; the M/S widening only adds energy to decorrelated
+        # content and the master limiter handles the occasional overshoot.
+        out = sub_stereo + mid_w + air_w
         return out.astype(stereo.dtype)
 
     def reset(self):
