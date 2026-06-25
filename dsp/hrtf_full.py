@@ -109,18 +109,26 @@ class _FilterChain:
 # Delay line (vectorised ring buffer, matching hrtf.py _DelayLine)
 # ---------------------------------------------------------------------------
 
+_MAX_BLOCK = 4096   # generous upper bound on block size for ring-buffer sizing
+
+
 class _DelayLine:
     MAX_DELAY = 256   # samples — covers ~5.3 ms max ITD with safety margin
 
     def __init__(self):
-        self._buf  = np.zeros(self.MAX_DELAY + 512, dtype=np.float64)
+        # Buffer = max delay + one block, so the read window never collides with
+        # the just-written current block (old size MAX_DELAY+512 only just held a
+        # 512 block and combined with the wrong read offset added 512 samples of
+        # common latency to both ears).
+        self._buf  = np.zeros(self.MAX_DELAY + _MAX_BLOCK + 2, dtype=np.float64)
         self._size = len(self._buf)
         self._pos  = 0
 
     def process(self, x: np.ndarray, delay: int) -> np.ndarray:
         n, sz, ptr = len(x), self._size, self._pos
         np.put(self._buf, np.arange(ptr, ptr + n) % sz, x)
-        r_idx = np.arange(ptr - delay - n, ptr - delay, dtype=np.int64) % sz
+        # [ptr-delay, ptr-delay+n) realizes exactly `delay` samples.
+        r_idx = np.arange(ptr - delay, ptr - delay + n, dtype=np.int64) % sz
         out = self._buf[r_idx].copy()
         self._pos = int((ptr + n) % sz)
         return out

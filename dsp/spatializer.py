@@ -35,6 +35,8 @@ from scipy.signal import lfilter, lfilter_zi
 from .filters import make_lr4_lowpass, make_lr4_highpass
 from .hrtf    import BinauralSpeakerRenderer
 
+_MAX_BLOCK = 4096   # generous upper bound on block size for ring-buffer sizing
+
 
 # -- Stereo upmix (Dolby Pro Logic II-inspired) --------------------------------
 
@@ -192,7 +194,7 @@ class StereoWidenerProcessor:
         # Haas-effect delay line (mono, applied to mid-band right channel)
         haas_ms = float(preset.get("haas_delay_ms", 22.0))
         haas_n  = max(1, int(round(haas_ms * fs / 1000)))
-        bsize   = haas_n + 1
+        bsize   = haas_n + _MAX_BLOCK + 1
         self._haas_buf   = np.zeros((bsize, 2), dtype=np.float64)
         self._haas_delay = haas_n
         self._haas_bsize = bsize
@@ -204,9 +206,11 @@ class StereoWidenerProcessor:
         x = mid.astype(np.float64)
         w_idx = np.arange(ptr, ptr + n, dtype=np.int64) % bsize
         buf[w_idx] = x
-        # Delay the right channel to create depth
+        # Delay the right channel to create depth.
+        # [ptr-d, ptr-d+n) realizes exactly d samples; the old [ptr-d-n, ptr-d)
+        # added a block and (with bsize=d+1) wrapped to ~one block of delay.
         d = self._haas_delay
-        r_idx = np.arange(ptr - d - n, ptr - d, dtype=np.int64) % bsize
+        r_idx = np.arange(ptr - d, ptr - d + n, dtype=np.int64) % bsize
         delayed_R = buf[r_idx, 1]
         self._haas_ptr = int((ptr + n) % bsize)
 

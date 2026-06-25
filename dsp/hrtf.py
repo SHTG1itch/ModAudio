@@ -97,18 +97,27 @@ class _MonoFilterChain:
 
 # -- Delay line (vectorised) ---------------------------------------------------
 
+_MAX_BLOCK = 4096   # generous upper bound on block size for ring-buffer sizing
+
+
 class _DelayLine:
     MAX_DELAY = 128   # samples - covers max Woodworth ITD (~25 samples at 48 kHz)
 
     def __init__(self):
-        self._buf  = np.zeros(self.MAX_DELAY + 2, dtype=np.float64)
+        # Buffer must hold (max delay + one block); the old size (MAX_DELAY+2)
+        # was far smaller than the 512-sample block, so writing a block wrapped
+        # the ring many times over and destroyed the signal instead of delaying
+        # it (np.put keeps only the last write to each repeated index).
+        self._buf  = np.zeros(self.MAX_DELAY + _MAX_BLOCK + 2, dtype=np.float64)
         self._size = len(self._buf)
         self._pos  = 0
 
     def process(self, x: np.ndarray, delay: int) -> np.ndarray:
         n, size, ptr = len(x), self._size, self._pos
         np.put(self._buf, np.arange(ptr, ptr+n) % size, x)
-        r_idx = np.arange(ptr - delay - n, ptr - delay, dtype=np.int64) % size
+        # Read window [ptr-delay, ptr-delay+n): realizes exactly `delay` samples
+        # (the old [ptr-delay-n, ptr-delay) realized delay+n).
+        r_idx = np.arange(ptr - delay, ptr - delay + n, dtype=np.int64) % size
         out = self._buf[r_idx].copy()
         self._pos = int((ptr + n) % size)
         return out

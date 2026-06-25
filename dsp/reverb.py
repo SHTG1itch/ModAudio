@@ -38,6 +38,12 @@ from scipy.signal import lfilter, lfilter_zi
 from .filters import make_highpass
 
 
+# Generous upper bound on the audio block size.  Every delay-line ring buffer is
+# sized to (max_delay + _MAX_BLOCK) so the read window [ptr-d, ptr-d+n) never
+# collides with the just-written current block, for any block up to this size.
+_MAX_BLOCK = 4096
+
+
 # -- Hadamard matrix (N=8) -----------------------------------------------------
 
 def _hadamard8():
@@ -72,7 +78,9 @@ class FDNReverb:
         self._fs      = fs
         self._H       = _hadamard8()
         self._delays  = _FDN_DELAYS.copy()
-        bsize         = int(np.max(self._delays)) + 1
+        # Buffer must hold at least (max_delay + one block); otherwise the read
+        # window for the deepest line wraps and the realized delay is wrong.
+        bsize         = int(np.max(self._delays)) + _MAX_BLOCK + 1
         self._buf     = np.zeros((bsize, self.N), dtype=np.float64)
         self._bsize   = bsize
         self._ptr     = 0
@@ -110,7 +118,7 @@ class FDNReverb:
 
         feedback = np.empty((n, self.N), dtype=np.float64)
         for k, d in enumerate(self._delays):
-            r_idx = np.arange(ptr - int(d) - n, ptr - int(d), dtype=np.int64) % bsize
+            r_idx = np.arange(ptr - int(d), ptr - int(d) + n, dtype=np.int64) % bsize
             feedback[:, k] = buf[r_idx, k]
 
         filtered = np.empty_like(feedback)
@@ -168,7 +176,7 @@ class EarlyReflections:
         self._fs    = fs
         self._ntaps = len(_ER_TAPS)
         max_delay   = int(max(t[0] for t in _ER_TAPS) * fs / 1000) + 2
-        self._bsize = max_delay + 1
+        self._bsize = max_delay + _MAX_BLOCK + 1
         self._buf   = np.zeros((self._bsize, 2), dtype=np.float64)
         self._ptr   = 0
 
@@ -190,7 +198,7 @@ class EarlyReflections:
 
         out = np.zeros((n, 2), dtype=np.float64)
         for j, d in enumerate(self._tap_delays):
-            r_idx = np.arange(ptr - int(d) - n, ptr - int(d), dtype=np.int64) % bsize
+            r_idx = np.arange(ptr - int(d), ptr - int(d) + n, dtype=np.int64) % bsize
             raw   = buf[r_idx] * self._gains[j]
             c     = self._lpf_c[j]
             b_lp  = np.array([1.0 - c])
@@ -223,7 +231,7 @@ class PreDelay:
     def __init__(self, delay_ms=22.0, fs=48000):
         self._delay  = int(round(delay_ms * fs / 1000))
         max_d        = max(self._delay, 1)
-        self._buf    = np.zeros((max_d + 1, 2), dtype=np.float64)
+        self._buf    = np.zeros((max_d + _MAX_BLOCK + 1, 2), dtype=np.float64)
         self._bsize  = len(self._buf)
         self._ptr    = 0
 
@@ -234,7 +242,7 @@ class PreDelay:
         w_idx = np.arange(ptr, ptr + n, dtype=np.int64) % bsize
         buf[w_idx] = x
 
-        r_idx = np.arange(ptr - self._delay - n, ptr - self._delay,
+        r_idx = np.arange(ptr - self._delay, ptr - self._delay + n,
                           dtype=np.int64) % bsize
         out      = buf[r_idx].copy()
         self._ptr = int((ptr + n) % bsize)

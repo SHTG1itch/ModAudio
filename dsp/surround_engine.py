@@ -58,7 +58,7 @@ from .hrtf_full import (
     _lowpass_ba,
     _MonoFilter,
 )
-from .filters import make_lowpass, make_highpass
+from .filters import make_lr4_lowpass, make_lr4_highpass
 
 
 # ---------------------------------------------------------------------------
@@ -93,9 +93,10 @@ class _AdaptiveUpmix71:
     When pan > +0.35:  RS += R · rs_ext
     """
 
-    # Smoothing alpha for ~50 ms at 48 kHz / 512-sample blocks.
-    # T_block ≈ 10.67 ms  →  alpha = exp(−10.67/50) ≈ 0.808
-    _ALPHA: float = 0.808
+    # Analysis smoothing time constant (seconds). The per-block alpha is
+    # derived from the actual block length so the smoothing speed is
+    # independent of block size and sample rate.
+    _SMOOTH_TC: float = 0.050
 
     def __init__(self, fs: int = 48000):
         self._fs = fs
@@ -135,8 +136,8 @@ class _AdaptiveUpmix71:
         coh_raw = float(np.clip(
             np.mean(L * R) / (L_rms * R_rms + 1e-12), 0.0, 1.0))
 
-        # Exponential smoothing
-        a = self._ALPHA
+        # Exponential smoothing (alpha from actual block duration)
+        a = float(np.exp(-(len(L) / self._fs) / self._SMOOTH_TC))
         self._pan = a * self._pan + (1.0 - a) * float(pan_raw)
         self._coh = a * self._coh + (1.0 - a) * coh_raw
 
@@ -228,10 +229,13 @@ class VirtualSurroundBinaural:
     def __init__(self, fs: int = 48000, preset: dict | None = None):
         p = preset or {}
 
-        self._lp_sub = make_lowpass(self.LO,  q=0.707, fs=fs, ch=2)
-        self._hp_mid = make_highpass(self.LO,  q=0.707, fs=fs, ch=2)
-        self._lp_mid = make_lowpass(self.HI,  q=0.707, fs=fs, ch=2)
-        self._hp_air = make_highpass(self.HI,  q=0.707, fs=fs, ch=2)
+        # LR4 crossovers: the three bands are summed back together at the
+        # output, and LR4 LP/HP pairs recombine flat (a single Butterworth
+        # biquad pair would notch the output at 120 Hz and 8 kHz).
+        self._lp_sub = make_lr4_lowpass(self.LO,  fs=fs, ch=2)
+        self._hp_mid = make_lr4_highpass(self.LO, fs=fs, ch=2)
+        self._lp_mid = make_lr4_lowpass(self.HI,  fs=fs, ch=2)
+        self._hp_air = make_lr4_highpass(self.HI, fs=fs, ch=2)
 
         self._upmix     = _AdaptiveUpmix71(fs)
         self._lfe_level = float(p.get("lfe_level",      0.85))
@@ -404,7 +408,9 @@ class VirtualSurroundMono:
 
         room = np.zeros(n, dtype=np.float64)
         for delay, gain, lpf in zip(self._delays, self._gains, self._tap_lpf):
-            r_idx = np.arange(ptr - delay - n, ptr - delay, dtype=np.int64) % sz
+            # [ptr-delay, ptr-delay+n) realizes exactly `delay` samples (the old
+            # [ptr-delay-n, ptr-delay) added a full block to every reflection).
+            r_idx = np.arange(ptr - delay, ptr - delay + n, dtype=np.int64) % sz
             tap   = buf[r_idx] * gain
             tap   = lpf.process(tap)
             room += tap
