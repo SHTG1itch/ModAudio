@@ -12,12 +12,18 @@ from scipy.signal import butter, sosfilt, sosfilt_zi, lfilter, lfilter_zi
 
 
 # -- Crossover filter design ---------------------------------------------------
+# Linkwitz-Riley 4th order: two cascaded 2nd-order Butterworth sections.
+# LR4 LP/HP pairs are phase-matched and sum to flat magnitude, so the bands
+# recombine without a notch at each crossover frequency (a single Butterworth
+# biquad pair is 180° out of phase at fc and cancels when summed).
 
-def _lr2_lp(fc, fs):
-    return butter(2, fc / (fs/2), btype='low',  output='sos')
+def _lr4_lp(fc, fs):
+    s = butter(2, fc / (fs/2), btype='low',  output='sos')
+    return np.vstack([s, s])
 
-def _lr2_hp(fc, fs):
-    return butter(2, fc / (fs/2), btype='high', output='sos')
+def _lr4_hp(fc, fs):
+    s = butter(2, fc / (fs/2), btype='high', output='sos')
+    return np.vstack([s, s])
 
 
 def _sos_stereo_zi(sos):
@@ -41,12 +47,22 @@ class _Band:
     def __init__(self, threshold_db, ratio, attack_ms, release_ms, makeup_db, fs):
         self._thr     = threshold_db
         self._ratio   = ratio
+        # Per-SAMPLE smoothing coefficients.  The envelope is updated once per
+        # block, which advances time by `n` samples, so the per-block factor is
+        # self._attack**n / self._release**n (raised in process()).  Applying
+        # the per-sample value once per block — as the old code did — made the
+        # effective time constant ~block_size× too slow: an 8 ms attack actually
+        # took ~1.2 s to reach 63 %, so the compressor never engaged on musical
+        # transients and the "theater dynamics" stage did almost nothing.
         self._attack  = np.exp(-1.0 / (attack_ms  * 1e-3 * fs))
         self._release = np.exp(-1.0 / (release_ms * 1e-3 * fs))
         self._makeup  = 10 ** (makeup_db / 20.0)
         self._gain_db = 0.0
+        self._prev_g  = self._makeup   # last linear gain applied (click-free ramp)
 
     def process(self, band: np.ndarray) -> np.ndarray:
+        n = band.shape[0]
+
         # Fast RMS: single dot-product, no intermediate array
         ss   = float(np.einsum('ij,ij', band, band))
         rms_db = 10.0 * np.log10(ss / band.size + 1e-24)
@@ -56,15 +72,21 @@ class _Band:
         else:
             gr = 0.0
 
-        if gr < self._gain_db:
-            self._gain_db = self._attack  * self._gain_db + (1 - self._attack)  * gr
-        else:
-            self._gain_db = self._release * self._gain_db + (1 - self._release) * gr
+        # Block-aware coefficient: advance the per-sample envelope by n samples
+        # so the attack/release times match their specified milliseconds.
+        coef = (self._attack if gr < self._gain_db else self._release) ** n
+        self._gain_db = coef * self._gain_db + (1.0 - coef) * gr
 
-        return band * (10 ** (self._gain_db / 20.0) * self._makeup)
+        g = 10 ** (self._gain_db / 20.0) * self._makeup
+        # Linearly ramp the gain across the block to avoid zipper noise now that
+        # the (correctly fast) gain can change substantially block to block.
+        ramp = np.linspace(self._prev_g, g, n, dtype=np.float64)[:, None]
+        self._prev_g = g
+        return band * ramp
 
     def reset(self):
         self._gain_db = 0.0
+        self._prev_g  = self._makeup
 
 
 # Band boundaries [Hz] and parameters
@@ -89,7 +111,7 @@ class MultibandCompressor:
         self._fs = fs
 
         # Pre-build SOS for each crossover
-        self._xsos = [(_lr2_lp(f, fs), _lr2_hp(f, fs)) for f in _XOVER]
+        self._xsos = [(_lr4_lp(f, fs), _lr4_hp(f, fs)) for f in _XOVER]
 
         # Filter states: list of [lp_zi, hp_zi], each (n_sec, 2, 2)
         self._xzi = [
@@ -191,7 +213,15 @@ class TransientEnhancer:
 # -- Peak limiter --------------------------------------------------------------
 
 class PeakLimiter:
-    """One-pole envelope peak limiter — vectorised."""
+    """One-pole envelope peak limiter — fully vectorised.
+
+    The instant-attack / exponential-release envelope recursion
+        env[n] = max(peak[n], rel * env[n-1])
+    has the closed form
+        env[n] = rel**n * max(env0 * rel, max_{k<=n} peak[k] * rel**-k)
+    which is computed per block with a running maximum (no Python loop).
+    rel**-n stays ~1.1 for typical block sizes, so no overflow risk.
+    """
 
     def __init__(self, threshold: float = 0.93, release_ms: float = 80.0,
                  fs: int = 48000):
@@ -199,16 +229,39 @@ class PeakLimiter:
         self._release   = np.exp(-1.0 / (release_ms * 1e-3 * fs))
         self._env       = 0.0
 
+    def _gain(self, peak: np.ndarray) -> np.ndarray:
+        """Per-sample limiter gain for a peak envelope input (N,)."""
+        n    = len(peak)
+        rel  = self._release
+        decay = rel ** np.arange(n, dtype=np.float64)        # rel**n
+        grow  = peak / decay                                  # peak * rel**-n
+        run   = np.maximum.accumulate(np.maximum(grow, self._env * rel))
+        env   = run * decay
+        self._env = float(env[-1])
+        thr = self._threshold
+        return thr / np.maximum(env, thr)
+
     def process(self, x: np.ndarray) -> np.ndarray:
         x64  = x.astype(np.float64)
         peak = np.abs(x64).max(axis=1)
-        out  = np.empty_like(x64)
-        thr, rel, env = self._threshold, self._release, self._env
-        for i in range(len(peak)):
-            env = max(peak[i], env * rel)
-            out[i] = x64[i] * thr / max(env, thr)
-        self._env = env
-        return out.astype(x.dtype)
+        gain = self._gain(peak)
+        return (x64 * gain[:, np.newaxis]).astype(x.dtype)
+
+    def process_linked(self, buses: list) -> list:
+        """Limit several (N, C) buses with one shared gain envelope.
+
+        The gain is computed from the loudest sample across ALL buses and
+        applied identically to every bus, so limiting never shifts the
+        relative level balance between speakers (which would smear the
+        spatial image whenever one bus clips before the others).
+        """
+        if not buses:
+            return buses
+        peak = np.abs(buses[0].astype(np.float64)).max(axis=1)
+        for b in buses[1:]:
+            np.maximum(peak, np.abs(b.astype(np.float64)).max(axis=1), out=peak)
+        gain = self._gain(peak)[:, np.newaxis]
+        return [(b.astype(np.float64) * gain).astype(b.dtype) for b in buses]
 
     def reset(self):
         self._env = 0.0
