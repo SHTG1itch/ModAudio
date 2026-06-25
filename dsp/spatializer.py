@@ -54,7 +54,7 @@ class _StereoUpmix:
         self._lfilter = lfilter
         self._b_ap = np.array([-0.6, 1.0])
         self._a_ap = np.array([ 1.0, -0.6])
-        zi = lfilter_zi(self._b_ap, self._a_ap)
+        zi = np.zeros(1)   # rest state (silence -> silence), not lfilter_zi
         self._zi_ls = zi.copy()
         self._zi_rs = zi.copy()
 
@@ -67,7 +67,7 @@ class _StereoUpmix:
         return {"L": L, "C": C, "R": R, "LS": LS, "RS": RS}
 
     def reset(self):
-        zi = lfilter_zi(self._b_ap, self._a_ap)
+        zi = np.zeros(1)
         self._zi_ls = zi.copy()
         self._zi_rs = zi.copy()
 

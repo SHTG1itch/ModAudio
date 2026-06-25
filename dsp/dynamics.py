@@ -27,8 +27,12 @@ def _lr4_hp(fc, fs):
 
 
 def _sos_stereo_zi(sos):
-    """Initial condition for a stereo (2-ch) SOS filter."""
-    zi1 = sosfilt_zi(sos)            # (n_sec, 2)
+    """Rest (zero) initial condition for a stereo (2-ch) SOS filter.
+
+    Not sosfilt_zi: that returns the unit-DC steady state, so a band fed
+    silence would emit a decaying startup transient instead of silence.
+    """
+    zi1 = np.zeros((sos.shape[0], 2))      # (n_sec, 2)
     return np.stack([zi1, zi1], axis=-1)   # (n_sec, 2, 2)
 
 

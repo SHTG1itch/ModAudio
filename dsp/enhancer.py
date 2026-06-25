@@ -22,7 +22,9 @@ from scipy.signal import butter, sosfilt, sosfilt_zi
 
 
 def _sos_stereo_zi(sos):
-    zi = sosfilt_zi(sos)
+    # Rest state (zeros), not sosfilt_zi: a filter fed silence must output
+    # silence, otherwise it emits a decaying startup transient.
+    zi = np.zeros((sos.shape[0], 2))
     return np.stack([zi, zi], axis=-1)   # (n_sec, 2, 2)
 
 
@@ -105,9 +107,17 @@ class AirBandExciter:
         self._hp_extract = _StereoSOS(butter(2, cutoff/(fs/2), btype='high', output='sos'))
         self._hp_isolate = _StereoSOS(butter(2, cutoff/(fs/2), btype='high', output='sos'))
 
+        # Anti-aliasing: band-limit the saturation input so its 2nd harmonics
+        # stay below Nyquist. Without this, the x^2 waveshaper on content above
+        # fs/4 (e.g. 14 kHz at 48 kHz) creates harmonics past Nyquist that fold
+        # back as inharmonic distortion. Driving only the 0.24*fs band keeps
+        # all generated harmonics below 0.48*fs.
+        aa_fc = min(0.24 * fs, fs / 2 * 0.98)
+        self._lp_drive = _StereoSOS(butter(4, aa_fc/(fs/2), btype='low', output='sos'))
+
     def process(self, stereo: np.ndarray) -> np.ndarray:
         x   = stereo.astype(np.float64)
-        air = self._hp_extract.process(x)
+        air = self._lp_drive.process(self._hp_extract.process(x))
 
         # Even-harmonic saturation: x + 0.25 * x^2 * sign(x)  (2nd harmonic)
         excited = air + 0.25 * (air * air) * np.sign(air)
@@ -120,3 +130,4 @@ class AirBandExciter:
     def reset(self):
         self._hp_extract.reset()
         self._hp_isolate.reset()
+        self._lp_drive.reset()

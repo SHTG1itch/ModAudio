@@ -104,18 +104,16 @@ class _AdaptiveUpmix71:
         # Stage-1 all-pass  (surround extraction, ≈90° rotation)
         b1 = np.array([-0.6, 1.0])
         a1 = np.array([ 1.0, -0.6])
-        zi1 = lfilter_zi(b1, a1)
         self._b1, self._a1 = b1, a1
-        self._zi_ls = zi1.copy()
-        self._zi_rs = zi1.copy()
+        self._zi_ls = np.zeros(1)   # rest state, not lfilter_zi
+        self._zi_rs = np.zeros(1)
 
         # Stage-2 all-pass  (rear channels, additional decorrelation)
         b2 = np.array([-0.3, 1.0])
         a2 = np.array([ 1.0, -0.3])
-        zi2 = lfilter_zi(b2, a2)
         self._b2, self._a2 = b2, a2
-        self._zi_lb = zi2.copy()
-        self._zi_rb = zi2.copy()
+        self._zi_lb = np.zeros(1)
+        self._zi_rb = np.zeros(1)
 
         # Smoothed analysis state
         self._pan: float = 0.0   # −1 (full left) to +1 (full right)
@@ -198,12 +196,10 @@ class _AdaptiveUpmix71:
         }
 
     def reset(self):
-        zi1 = lfilter_zi(self._b1, self._a1)
-        zi2 = lfilter_zi(self._b2, self._a2)
-        self._zi_ls = zi1.copy()
-        self._zi_rs = zi1.copy()
-        self._zi_lb = zi2.copy()
-        self._zi_rb = zi2.copy()
+        self._zi_ls = np.zeros(1)
+        self._zi_rs = np.zeros(1)
+        self._zi_lb = np.zeros(1)
+        self._zi_rb = np.zeros(1)
         self._pan = 0.0
         self._coh = 0.7
 
@@ -384,10 +380,9 @@ class VirtualSurroundMono:
         # the HRTF-processed L and R channels without hard cancellation.
         b_ap = np.array([-0.12, 1.0])
         a_ap = np.array([ 1.0, -0.12])
-        zi   = lfilter_zi(b_ap, a_ap)
         self._b_ap, self._a_ap = b_ap, a_ap
-        self._zi_cf_l = zi.copy()
-        self._zi_cf_r = zi.copy()
+        self._zi_cf_l = np.zeros(1)   # rest state, not lfilter_zi
+        self._zi_cf_r = np.zeros(1)
 
     def process(self, stereo: np.ndarray) -> np.ndarray:
         """(N, 2) float32 → (N, 2) float32  [both channels identical: mono]"""
@@ -427,9 +422,8 @@ class VirtualSurroundMono:
         self._rptr = 0
         for f in self._tap_lpf:
             f.reset()
-        zi = lfilter_zi(self._b_ap, self._a_ap)
-        self._zi_cf_l = zi.copy()
-        self._zi_cf_r = zi.copy()
+        self._zi_cf_l = np.zeros(1)
+        self._zi_cf_r = np.zeros(1)
 
 
 # ---------------------------------------------------------------------------

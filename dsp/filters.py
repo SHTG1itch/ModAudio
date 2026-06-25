@@ -114,8 +114,13 @@ class BiquadFilter:
     def __init__(self, b, a, num_channels: int = 2):
         self.b = np.asarray(b, dtype=np.float64)
         self.a = np.asarray(a, dtype=np.float64)
-        zi_single = lfilter_zi(self.b, self.a)            # shape (2,)
-        self._zi = np.stack([zi_single] * num_channels, axis=-1)  # (2, C)
+        # Cold-start at REST (zeros), not lfilter_zi.  lfilter_zi returns the
+        # state whose zero-input response is the steady state of a unit-DC
+        # input, so a filter fed silence would emit a decaying thump at startup
+        # (and on every chain rebuild).  Zero state gives silence -> silence.
+        n_state = max(len(self.a), len(self.b)) - 1
+        zi_single = np.zeros(n_state)
+        self._zi = np.stack([zi_single] * num_channels, axis=-1)  # (n_state, C)
 
     def process(self, x: np.ndarray) -> np.ndarray:
         """
@@ -134,7 +139,7 @@ class BiquadFilter:
         return out.astype(x.dtype, copy=False)
 
     def reset(self):
-        zi_single = lfilter_zi(self.b, self.a)
+        zi_single = np.zeros(self._zi.shape[0])
         self._zi = np.stack([zi_single] * self._zi.shape[1], axis=-1)
 
 
@@ -175,3 +180,20 @@ def make_lowpass(fc, q=0.707, fs=48000, ch=2) -> BiquadFilter:
 def make_highpass(fc, q=0.707, fs=48000, ch=2) -> BiquadFilter:
     b, a = _highpass(fc, q, fs)
     return BiquadFilter(b, a, ch)
+
+
+def make_lr4_lowpass(fc, fs=48000, ch=2) -> FilterChain:
+    """4th-order Linkwitz-Riley low-pass (two cascaded Q=0.707 biquads).
+
+    An LR4 LP/HP pair at the same fc sums to a flat-magnitude allpass —
+    use these (never a single Butterworth biquad pair) whenever a signal is
+    band-split and the bands are later recombined, otherwise the recombined
+    output has a deep notch at the crossover frequency.
+    """
+    b, a = _lowpass(fc, 0.7071067811865476, fs)
+    return FilterChain([BiquadFilter(b, a, ch), BiquadFilter(b, a, ch)])
+
+def make_lr4_highpass(fc, fs=48000, ch=2) -> FilterChain:
+    """4th-order Linkwitz-Riley high-pass (two cascaded Q=0.707 biquads)."""
+    b, a = _highpass(fc, 0.7071067811865476, fs)
+    return FilterChain([BiquadFilter(b, a, ch), BiquadFilter(b, a, ch)])

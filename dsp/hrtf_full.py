@@ -81,14 +81,15 @@ class _MonoFilter:
     def __init__(self, b, a):
         self._b  = np.asarray(b, dtype=np.float64)
         self._a  = np.asarray(a, dtype=np.float64)
-        self._zi = lfilter_zi(self._b, self._a).copy()
+        # Start at rest (silence -> silence); see note in filters.BiquadFilter.
+        self._zi = np.zeros(max(len(self._a), len(self._b)) - 1)
 
     def process(self, x: np.ndarray) -> np.ndarray:
         y, self._zi = lfilter(self._b, self._a, x.astype(np.float64), zi=self._zi)
         return y
 
     def reset(self):
-        self._zi = lfilter_zi(self._b, self._a).copy()
+        self._zi = np.zeros(max(len(self._a), len(self._b)) - 1)
 
 
 class _FilterChain:
