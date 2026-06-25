@@ -388,13 +388,16 @@ class VirtualSurroundMono:
         """(N, 2) float32 → (N, 2) float32  [both channels identical: mono]"""
         binaural = self._binaural.process(stereo)
 
-        # Phase-smooth mono collapse via allpass crossfeed
+        # Flat mono downmix.  The previous "allpass crossfeed" computed
+        #   0.3·(L+R) + 0.2·allpass(L+R),
+        # i.e. it operated on the SUM, so it could not fill the comb notches it
+        # was meant to smooth — it only added a spurious HF rolloff (≈ −4 dB at
+        # 12 kHz, −11 dB at 20 kHz) on top of the intended HRTF shaping. The
+        # HRTF spectral cues survive a plain mono sum (Blauert 1997), so sum
+        # the two ears flat.
         L64 = binaural[:, 0].astype(np.float64)
         R64 = binaural[:, 1].astype(np.float64)
-        L_cf, self._zi_cf_l = lfilter(self._b_ap, self._a_ap, L64, zi=self._zi_cf_l)
-        R_cf, self._zi_cf_r = lfilter(self._b_ap, self._a_ap, R64, zi=self._zi_cf_r)
-        # Blend: 0.5*direct + 0.5*crossfed-opposite gives smooth phase
-        mono = (L64 * 0.6 + R_cf * 0.4 + R64 * 0.6 + L_cf * 0.4) * 0.5
+        mono = (L64 + R64) * 0.5
 
         buf, sz, ptr = self._rbuf, self._rsz, self._rptr
         n = len(mono)
