@@ -143,8 +143,10 @@ class BinauralSurroundProcessor:
         out_L += air_M + self._air_width * air_S
         out_R += air_M - self._air_width * air_S
 
-        # Normalise (5 channels summing)
-        mix_gain = 1.0 / 3.5
+        # Normalise the summed bands.  1/3.5 left headphone output ~4 dB
+        # quieter than the (level-correct) speaker mode, with the limiter never
+        # engaging; 1/2.2 brings it to roughly unity / matched gain staging.
+        mix_gain = 1.0 / 2.2
         out = np.stack([out_L * mix_gain, out_R * mix_gain], axis=1)
         return out.astype(stereo.dtype)
 

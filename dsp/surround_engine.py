@@ -288,8 +288,10 @@ class VirtualSurroundBinaural:
         out_L += M + self._air_width * S
         out_R += M - self._air_width * S
 
-        # Normalise (7 channels + LFE + air)
-        gain = 1.0 / 4.5
+        # Normalise the summed bands.  1/4.5 left surround output ~6 dB quieter
+        # than the (level-correct) speaker mode; 1/2.4 matches the gain staging
+        # (also lifts surround_mono, which renders through this path).
+        gain = 1.0 / 2.4
         out  = np.stack([out_L * gain, out_R * gain], axis=1)
         return out.astype(stereo.dtype)
 
