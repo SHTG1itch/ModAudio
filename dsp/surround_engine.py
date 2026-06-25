@@ -377,15 +377,6 @@ class VirtualSurroundMono:
             b, a = _lowpass_ba(fc, 0.707, float(fs))
             self._tap_lpf.append(_MonoFilter(b, a))
 
-        # Allpass crossfeed for phase-smooth mono collapse
-        # First-order allpass at ~700 Hz  →  gradual phase rotation blends
-        # the HRTF-processed L and R channels without hard cancellation.
-        b_ap = np.array([-0.12, 1.0])
-        a_ap = np.array([ 1.0, -0.12])
-        self._b_ap, self._a_ap = b_ap, a_ap
-        self._zi_cf_l = np.zeros(1)   # rest state, not lfilter_zi
-        self._zi_cf_r = np.zeros(1)
-
     def process(self, stereo: np.ndarray) -> np.ndarray:
         """(N, 2) float32 → (N, 2) float32  [both channels identical: mono]"""
         binaural = self._binaural.process(stereo)
@@ -427,8 +418,6 @@ class VirtualSurroundMono:
         self._rptr = 0
         for f in self._tap_lpf:
             f.reset()
-        self._zi_cf_l = np.zeros(1)
-        self._zi_cf_r = np.zeros(1)
 
 
 # ---------------------------------------------------------------------------
