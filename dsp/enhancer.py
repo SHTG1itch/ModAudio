@@ -119,8 +119,14 @@ class AirBandExciter:
         x   = stereo.astype(np.float64)
         air = self._lp_drive.process(self._hp_extract.process(x))
 
-        # Even-harmonic saturation: x + 0.25 * x^2 * sign(x)  (2nd harmonic)
-        excited = air + 0.25 * (air * air) * np.sign(air)
+        # Even-harmonic saturation: x + 0.25*x^2  (2nd harmonic).
+        # The old shaper multiplied by sign(x), which makes x*|x| an ODD
+        # function — it produced the 3rd harmonic instead, and for the
+        # 8-11.5 kHz drive band that 3rd harmonic (24-34 kHz) folded back as
+        # audible aliasing (~-14 dBc near 13-18 kHz). The even x^2 term yields
+        # the intended 2nd harmonic (16-23 kHz, below Nyquist, no aliasing);
+        # its DC/low-frequency component is removed by the HP-isolate below.
+        excited = air + 0.25 * (air * air)
 
         # Isolate new harmonics using a separate HP instance (no state aliasing)
         delta = self._hp_isolate.process(excited - air)
