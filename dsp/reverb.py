@@ -35,6 +35,8 @@ from __future__ import annotations
 import numpy as np
 from scipy.signal import lfilter, lfilter_zi
 
+from .filters import make_highpass
+
 
 # -- Hadamard matrix (N=8) -----------------------------------------------------
 
@@ -76,9 +78,21 @@ class FDNReverb:
         self._ptr     = 0
 
         delay_s       = self._delays / fs
-        self._g_lf    = 10.0 ** (-3.0 * delay_s / rt60)
-        self._g_hf    = 10.0 ** (-3.0 * delay_s / rt60_hf)
-        self._tc      = 0.85
+        g_lf          = 10.0 ** (-3.0 * delay_s / rt60)
+        g_hf          = 10.0 ** (-3.0 * delay_s / rt60_hf)
+
+        # Per-line damping filter  H(z) = b0 / (1 - a1·z⁻¹).
+        # Calibrated so the per-pass magnitude equals g_lf at DC and g_hf at
+        # Nyquist.  Because rt60_hf < rt60 we have g_hf < g_lf, giving a1 > 0
+        # (a genuine low-pass shelf) so HF decays FASTER than LF — the physical
+        # behaviour of air absorption.  The previous form (b=[g_lf],
+        # a=[1, -(g_hf-g_lf)·0.85]) put the pole on the negative real axis,
+        # which made treble RING LONGER than bass (metallic, splashy tail) and
+        # also mis-set the overall RT60.
+        #     a1 = (g_lf - g_hf) / (g_lf + g_hf)   →  |H(0)|=g_lf, |H(π)|=g_hf
+        #     b0 = g_lf · (1 - a1)
+        self._damp_a1 = (g_lf - g_hf) / (g_lf + g_hf)
+        self._damp_b0 = g_lf * (1.0 - self._damp_a1)
         self._flt_zi  = np.zeros((1, self.N), dtype=np.float64)
 
         self._in_gain          = np.zeros((2, self.N), dtype=np.float64)
@@ -101,9 +115,8 @@ class FDNReverb:
 
         filtered = np.empty_like(feedback)
         for k in range(self.N):
-            b = np.array([self._g_lf[k]])
-            c = (self._g_hf[k] - self._g_lf[k]) * self._tc
-            a = np.array([1.0, -c])
+            b = np.array([self._damp_b0[k]])
+            a = np.array([1.0, -self._damp_a1[k]])
             col, self._flt_zi[:, k] = lfilter(b, a, feedback[:, k],
                                                zi=self._flt_zi[:, k])
             filtered[:, k] = col
@@ -252,9 +265,14 @@ class TheaterReverb:
         self._er  = EarlyReflections(fs)
         self._fdn = FDNReverb(rt60=preset["rt60"], rt60_hf=preset["rt60_hf"], fs=fs)
 
+        # High-pass the wet send: sub-bass reverberation reads as mud rather
+        # than space, and the LFE band is handled separately downstream.
+        # The dry path is untouched so the recombined LF response stays flat.
+        self._wet_hp = make_highpass(110.0, q=0.707, fs=fs, ch=2)
+
     def process(self, stereo):
-        # Pre-delay the signal fed into ER and FDN
-        pd  = self._pre.process(stereo)
+        # Pre-delay + high-pass the signal fed into ER and FDN
+        pd  = self._wet_hp.process(self._pre.process(stereo))
         er  = self._er.process(pd)
         rev = self._fdn.process(pd)
 
@@ -268,3 +286,4 @@ class TheaterReverb:
         self._pre.reset()
         self._er.reset()
         self._fdn.reset()
+        self._wet_hp.reset()
