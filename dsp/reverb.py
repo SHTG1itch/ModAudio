@@ -38,9 +38,13 @@ from scipy.signal import lfilter, lfilter_zi
 from .filters import make_highpass
 
 
-# Generous upper bound on the audio block size.  Every delay-line ring buffer is
-# sized to (max_delay + _MAX_BLOCK) so the read window [ptr-d, ptr-d+n) never
-# collides with the just-written current block, for any block up to this size.
+# Generous upper bound on the audio block size.  Each feed-forward delay line
+# (PreDelay, EarlyReflections) is sized to (max_delay + _MAX_BLOCK) so its read
+# window [ptr-d, ptr-d+n) never collides with the just-written current block for
+# any block up to this size.  NOTE: the FDN is a FEEDBACK loop and reads each
+# line before writing it, so its correctness additionally requires the block
+# size to be <= the shortest FDN delay (min(_FDN_DELAYS) = 1481 samples); the
+# app's block size is 512, well within that bound.
 _MAX_BLOCK = 4096
 
 

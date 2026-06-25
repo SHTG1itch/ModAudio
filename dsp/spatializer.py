@@ -143,9 +143,12 @@ class BinauralSurroundProcessor:
         out_L += air_M + self._air_width * air_S
         out_R += air_M - self._air_width * air_S
 
-        # Normalise the summed bands.  1/3.5 left headphone output ~4 dB
-        # quieter than the (level-correct) speaker mode, with the limiter never
-        # engaging; 1/2.2 brings it to roughly unity / matched gain staging.
+        # Normalise the summed bands.  1/3.5 left the headphone path ~4 dB
+        # quieter than the (level-correct) speaker mode with the limiter never
+        # engaging; 1/2.2 adds back +4 dB.  Correlated/centred content stays a
+        # few dB below speaker mode by design — the HRTF head-shadow and pinna
+        # notches genuinely remove energy — but broadband material now sits
+        # within ~1-2 dB of the other modes.
         mix_gain = 1.0 / 2.2
         out = np.stack([out_L * mix_gain, out_R * mix_gain], axis=1)
         return out.astype(stereo.dtype)
@@ -193,36 +196,36 @@ class StereoWidenerProcessor:
         self._lfe_level = preset["lfe_level"]
         self._air_width = preset.get("stereo_width", 1.8)
 
-        # Haas-effect delay line (mono, applied to mid-band right channel)
+        # Haas-effect delay line (mono — applied to the mid-band SIDE signal)
         haas_ms = float(preset.get("haas_delay_ms", 22.0))
         haas_n  = max(1, int(round(haas_ms * fs / 1000)))
         bsize   = haas_n + _MAX_BLOCK + 1
-        self._haas_buf   = np.zeros((bsize, 2), dtype=np.float64)
+        self._haas_buf   = np.zeros(bsize, dtype=np.float64)
         self._haas_delay = haas_n
         self._haas_bsize = bsize
         self._haas_ptr   = 0
 
-    def _haas_process(self, mid):
-        """Apply Haas delay to the mid-band stereo signal."""
-        n, buf, bsize, ptr = mid.shape[0], self._haas_buf, self._haas_bsize, self._haas_ptr
-        x = mid.astype(np.float64)
+    def _haas_process(self, side):
+        """Add Haas depth to the (mono) mid-band SIDE signal.
+
+        The depth blend (x + 0.4·x_delayed)/1.4 is a comb filter.  Applying it
+        to the L/R channels combs everything — including centered/mono content
+        such as dialogue and vocals.  Applying it to the SIDE (difference)
+        component instead leaves the centre (M) untouched, so mono material is
+        comb-free while the decorrelated/ambient part still gains depth, and the
+        L/R balance stays symmetric.
+        """
+        n, buf, bsize, ptr = side.shape[0], self._haas_buf, self._haas_bsize, self._haas_ptr
+        x = side.astype(np.float64)
         w_idx = np.arange(ptr, ptr + n, dtype=np.int64) % bsize
         buf[w_idx] = x
         # [ptr-d, ptr-d+n) realizes exactly d samples; the old [ptr-d-n, ptr-d)
         # added a block and (with bsize=d+1) wrapped to ~one block of delay.
         d = self._haas_delay
         r_idx = np.arange(ptr - d, ptr - d + n, dtype=np.int64) % bsize
-        delayed = buf[r_idx]                     # both channels, delayed
+        delayed = buf[r_idx]
         self._haas_ptr = int((ptr + n) % bsize)
-
-        # Symmetric cross-channel Haas: each output blends in a delayed copy of
-        # the OPPOSITE channel for depth/width.  Delaying only the right channel
-        # (the previous behaviour) comb-filtered just that channel and pulled
-        # the whole image ~0.7 dB to the left; the symmetric form is balanced.
-        out = np.empty_like(x)
-        out[:, 0] = (x[:, 0] + 0.4 * delayed[:, 1]) / 1.4
-        out[:, 1] = (x[:, 1] + 0.4 * delayed[:, 0]) / 1.4
-        return out
+        return (x + 0.4 * delayed) / 1.4
 
     def process(self, stereo):
         sub  = self._lp_sub.process(stereo)
@@ -234,11 +237,12 @@ class StereoWidenerProcessor:
         sub_mono = (sub[:, 0] + sub[:, 1]) * 0.5 * self._lfe_level
         sub_stereo = np.stack([sub_mono, sub_mono], axis=1)
 
-        # Mid-band: M/S width + Haas depth
+        # Mid-band: M/S width with Haas depth applied to the SIDE only, so the
+        # centre (dialogue/vocals) is not comb-filtered.
         M   = (mid[:, 0] + mid[:, 1]) * 0.5
         S   = (mid[:, 0] - mid[:, 1]) * 0.5
+        S   = self._haas_process(S)
         mid_w = np.stack([M + self._width * S, M - self._width * S], axis=1)
-        mid_w = self._haas_process(mid_w)
 
         # Air band: wider M/S expansion
         air_M = (air[:, 0] + air[:, 1]) * 0.5
