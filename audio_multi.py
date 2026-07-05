@@ -50,6 +50,7 @@ import numpy as np
 import sounddevice as sd
 
 from dsp.multi_speaker import MultiSpeakerChain
+from config import SOUND_SPEED_MS
 
 # ---------------------------------------------------------------------------
 # Optional WASAPI loopback backend (pyaudiowpatch)
@@ -352,6 +353,14 @@ class MultiDeviceStream:
     acoustic_delay_ms : extra delay applied to the FRONT stream to compensate for
                         the rear speaker being physically farther from the listener
                         (0 = no compensation).  Independent of Bluetooth delay.
+    front_dist_m      : physical distance of the front speaker from the listener
+                        (metres).  When both distances are given and
+                        acoustic_delay_ms is 0, wavefront alignment is computed
+                        automatically: the NEARER speaker is delayed by the
+                        path-length difference so both wavefronts arrive together
+                        (otherwise the precedence effect pulls the image toward
+                        the nearer speaker).
+    rear_dist_m       : same, for the rear speaker.
     """
 
     def __init__(
@@ -372,6 +381,10 @@ class MultiDeviceStream:
         acoustic_delay_ms: float = 0.0,
         front_info: tuple | None = None,
         rear_info:  tuple | None = None,
+        front_eq=None,
+        rear_eq=None,
+        front_dist_m: float | None = None,
+        rear_dist_m:  float | None = None,
     ):
         self._in_dev    = in_dev
         self._front_dev = front_dev
@@ -384,7 +397,9 @@ class MultiDeviceStream:
                                         bass_priority=bass_priority,
                                         rear_az_deg=rear_az_deg,
                                         front_info=front_info,
-                                        rear_info=rear_info)
+                                        rear_info=rear_info,
+                                        front_eq=front_eq,
+                                        rear_eq=rear_eq)
 
         # -- Bluetooth detection ------------------------------------------
         devs = sd.query_devices()
@@ -403,14 +418,30 @@ class MultiDeviceStream:
         self._rear_comp_delay  = 0
         self._apply_bt_delay(bt_delay_ms)
 
-        # -- Acoustic (distance) delay —  delays FRONT to align wavefronts
-        # when the rear speaker is physically farther from the listener.
-        # Applied on top of Bluetooth compensation, but only to front stream.
+        # -- Acoustic (distance) delay — aligns wavefront arrival times when
+        # the speakers are at different distances from the listener.  Kept
+        # separate from Bluetooth compensation so a BT-delay update can never
+        # silently wipe the acoustic alignment (and vice versa); the two are
+        # summed at processing time.
+        #   Manual mode : acoustic_delay_ms > 0 delays the front stream.
+        #   Auto mode   : both distances known → delay the NEARER speaker by
+        #                 the path-length difference (d/343 m·s⁻¹), otherwise
+        #                 the precedence effect drags the image toward it.
+        self._front_dist_delay = 0
+        self._rear_dist_delay  = 0
         acou_samp = int(round(float(acoustic_delay_ms) * fs / 1000.0))
-        if acou_samp > 0 and self._front_comp_delay == 0:
-            # Only apply if BT hasn't already delayed the front
-            self._front_comp_delay = acou_samp
+        if acou_samp > 0:
+            self._front_dist_delay = acou_samp
+        elif front_dist_m is not None and rear_dist_m is not None:
+            diff_samp = int(round((float(rear_dist_m) - float(front_dist_m))
+                                  / SOUND_SPEED_MS * fs))
+            if diff_samp > 0:
+                self._front_dist_delay = min(diff_samp, max_d - block_size - 256)
+            elif diff_samp < 0:
+                self._rear_dist_delay = min(-diff_samp, max_d - block_size - 256)
         self._acoustic_delay_ms = float(acoustic_delay_ms)
+        self._front_dist_m = front_dist_m
+        self._rear_dist_m  = rear_dist_m
 
         # -- Per-bus gains ------------------------------------------------
         self._front_gain   = float(front_gain)
@@ -502,11 +533,11 @@ class MultiDeviceStream:
 
     @property
     def front_delay_ms(self) -> float:
-        return self._front_comp_delay * 1000.0 / self._fs
+        return (self._front_comp_delay + self._front_dist_delay) * 1000.0 / self._fs
 
     @property
     def rear_delay_ms(self) -> float:
-        return self._rear_comp_delay * 1000.0 / self._fs
+        return (self._rear_comp_delay + self._rear_dist_delay) * 1000.0 / self._fs
 
     # ------------------------------------------------------------------ #
     # Auto-calibration
@@ -573,7 +604,17 @@ class MultiDeviceStream:
             fs=self._fs, preset=preset,
             bass_priority=old._bass_priority if old is not None else "equal",
             rear_az_deg=old._rear_az_deg     if old is not None else 150.0,
+            front_info=old._front_info       if old is not None else None,
+            rear_info=old._rear_info         if old is not None else None,
+            front_eq=old._front_eq           if old is not None else None,
+            rear_eq=old._rear_eq             if old is not None else None,
         )
+
+    def update_speaker_eqs(self, front_eq, rear_eq) -> None:
+        """Attach custom EQ objects to front/rear buses."""
+        if self._chain is not None:
+            self._chain.set_bus_eq("front", front_eq)
+            self._chain.set_bus_eq("rear",  rear_eq)
 
     # ------------------------------------------------------------------ #
     # Processing thread
@@ -606,11 +647,13 @@ class MultiDeviceStream:
                 print(f"[multi/dsp] {exc}")
                 continue
 
-            # BT delay compensation
-            if self._front_comp_delay > 0:
-                front = self._front_delay_buf.process(front, self._front_comp_delay)
-            if self._rear_comp_delay > 0:
-                rear = self._rear_delay_buf.process(rear, self._rear_comp_delay)
+            # Delay compensation: Bluetooth + acoustic distance alignment
+            f_delay = self._front_comp_delay + self._front_dist_delay
+            r_delay = self._rear_comp_delay  + self._rear_dist_delay
+            if f_delay > 0:
+                front = self._front_delay_buf.process(front, f_delay)
+            if r_delay > 0:
+                rear = self._rear_delay_buf.process(rear, r_delay)
 
             # Apply gains
             front = front * self._front_gain
@@ -958,6 +1001,15 @@ class MultiSpeakerStreamN:
     speaker_face_azs   : list of N facing azimuths in degrees (optional,
                          default: each speaker facing toward the listener)
     speaker_face_els   : list of N facing elevations in degrees (optional, default 0)
+    speaker_distances  : list of N distances from the listener in metres
+                         (optional).  When given, automatic time + level
+                         alignment is applied per speaker: nearer speakers are
+                         digitally delayed so all wavefronts arrive at the
+                         listener simultaneously (otherwise the precedence
+                         effect pulls the entire image toward the nearest
+                         speaker), and attenuated by the inverse-distance law
+                         so all speakers are equally loud at the listening
+                         position.
     fs                 : sample rate (Hz)
     block_size         : audio block size (samples)
     preset             : theater preset dict
@@ -974,12 +1026,14 @@ class MultiSpeakerStreamN:
         speaker_elevations: list | None = None,
         speaker_face_azs:   list | None = None,
         speaker_face_els:   list | None = None,
+        speaker_distances:  list | None = None,
         fs: int = 48000,
         block_size: int = 512,
         preset: dict | None = None,
         bt_delay_ms: float = 150.0,
         gains: list | None = None,
         bass_priority: str = "equal",
+        speaker_eqs: list | None = None,
     ):
         if len(speaker_devs) < 1:
             raise ValueError("speaker_devs must have at least one device")
@@ -1007,6 +1061,7 @@ class MultiSpeakerStreamN:
             speaker_face_azs=speaker_face_azs,
             speaker_face_els=speaker_face_els,
             bass_priority=bass_priority,
+            speaker_eqs=speaker_eqs,
         )
 
         # Bluetooth delay — applied as a digital delay to the faster speakers
@@ -1019,10 +1074,16 @@ class MultiSpeakerStreamN:
             self._is_bt.append(is_bluetooth_device(nm))
 
         max_d = int(round(500.0 * fs / 1000.0)) + block_size + 256
+        self._max_delay  = max_d - block_size - 256
         self._delay_bufs = [_DelayBuffer(max_d, channels=2)
                             for _ in range(self._N)]
         self._delay_samp = [0] * self._N
         self._apply_bt_delay(bt_delay_ms)
+
+        # Per-speaker distance compensation (time + level alignment)
+        self._dist_delay_samp = [0] * self._N
+        self._dist_gain       = [1.0] * self._N
+        self._apply_distances(speaker_distances)
 
         # Ring buffers  (one per output device)
         ring_frames = int(round(_RING_MS * fs / 1000.0))
@@ -1063,15 +1124,39 @@ class MultiSpeakerStreamN:
     def update_bt_delay(self, bt_delay_ms: float) -> None:
         self._apply_bt_delay(bt_delay_ms)
 
+    def _apply_distances(self, distances: list | None) -> None:
+        """Compute per-speaker time + level alignment from listener distances.
+
+        Nearer speakers are delayed by the path-length difference to the
+        farthest speaker (wavefront alignment) and attenuated by d_i/d_max
+        (inverse-distance level matching at the listening position).
+        """
+        if not distances or len(distances) != self._N:
+            self._dist_delay_samp = [0] * self._N
+            self._dist_gain       = [1.0] * self._N
+            return
+        ds = [max(0.1, float(d)) for d in distances]
+        d_max = max(ds)
+        self._dist_delay_samp = [
+            min(self._max_delay,
+                int(round((d_max - d) / SOUND_SPEED_MS * self._fs)))
+            for d in ds
+        ]
+        # Clamp so a speaker very close to the listener isn't muted entirely
+        self._dist_gain = [max(0.25, d / d_max) for d in ds]
+
     def update_speakers(
         self,
         azimuths:   list,
         elevations: list | None = None,
         face_azs:   list | None = None,
         face_els:   list | None = None,
+        distances:  list | None = None,
     ) -> None:
         """Update speaker positions/orientations and rebuild VBAP routing matrix."""
         self._chain.update_speakers(azimuths, elevations, face_azs, face_els)
+        if distances is not None:
+            self._apply_distances(distances)
 
     def update_speaker_azimuths(self, azimuths: list) -> None:
         """Backward-compatible alias — updates azimuths only."""
@@ -1094,7 +1179,13 @@ class MultiSpeakerStreamN:
             speaker_face_azs=face_azs,
             speaker_face_els=face_els,
             bass_priority=old._bass_priority,
+            speaker_eqs=list(old._speaker_eqs) if old._speaker_eqs else None,
         )
+
+    def update_speaker_eqs(self, eqs: list) -> None:
+        """Attach per-speaker custom EQ objects to the running chain."""
+        if self._chain is not None:
+            self._chain.set_all_speaker_eqs(eqs)
 
     def update_gains(self, gains: list) -> None:
         self._gains = [float(g) for g in gains]
@@ -1208,10 +1299,15 @@ class MultiSpeakerStreamN:
 
             for i, stereo in enumerate(buses):
                 gain = self._gains[i] if i < len(self._gains) else 1.0
+                if i < len(self._dist_gain):
+                    gain *= self._dist_gain[i]   # inverse-distance level match
                 stereo = stereo * gain
-                # Apply BT compensation delay
-                if self._delay_samp[i] > 0:
-                    stereo = self._delay_bufs[i].process(stereo, self._delay_samp[i])
+                # BT compensation + wavefront (distance) alignment delay
+                delay = self._delay_samp[i]
+                if i < len(self._dist_delay_samp):
+                    delay += self._dist_delay_samp[i]
+                if delay > 0:
+                    stereo = self._delay_bufs[i].process(stereo, delay)
                 self._out_rings[i].write(stereo)
 
     def stop(self) -> None:
