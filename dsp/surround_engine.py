@@ -74,6 +74,8 @@ class _AdaptiveUpmix71:
     Static extraction
     -----------------
     C  = (L + R) / 2
+    FL = L − 0.5·C                       — centre subtracted so dialog isn't
+    FR = R − 0.5·C                         triple-counted in FL/FR/C
     LS = AllPass90(L − 0.7·C)            — left-side decorrelated ambient
     RS = AllPass90(R − 0.7·C)
     LB = AllPass30(LS · 0.8)             — further-decorrelated rear
@@ -144,6 +146,13 @@ class _AdaptiveUpmix71:
 
         # --- Static channel extraction ------------------------------------
         C     = (L + R) * 0.5
+        # Subtract the extracted centre from the fronts (standard matrix-
+        # decoder practice).  Without this, centred content (dialog) appears
+        # at full level in FL, FR *and* C simultaneously → up to +4 dB mono
+        # build-up and comb coloration once the three virtual channels land
+        # on the same physical drivers.
+        FL    = L - C * 0.5
+        FR    = R - C * 0.5
         ls_src = L - C * 0.7
         rs_src = R - C * 0.7
 
@@ -154,10 +163,15 @@ class _AdaptiveUpmix71:
 
         # --- Adaptive gains -----------------------------------------------
 
-        # Coherence → surround scale
+        # Coherence → surround scale, gated by pan position.
         # More diffuse audio (music, ambience) = wider surround envelope.
         # Correlated (mono, dialog) = quieter surrounds so dialog stays front.
-        surr_scale = 0.55 + (1.0 - coh) * 1.0   # range [0.55, 1.55]
+        # The pan gate matters because a dry source panned hard to one side
+        # has coh ≈ 0 (L·R ≈ 0) yet is NOT diffuse — without the gate it
+        # would get boosted into the surrounds *and* pan-extended, smearing
+        # panned effects rearward at multiple delays.
+        diffuseness = (1.0 - coh) * (1.0 - abs(pan))
+        surr_scale = 0.55 + diffuseness * 1.0   # range [0.55, 1.55]
 
         # Pan extension: hard-left/right feeds into corresponding surround channel.
         # This is the key mechanism for "wrap-around" movement —
@@ -185,9 +199,17 @@ class _AdaptiveUpmix71:
         LB_out = LB * surr_scale + L * lb_ext
         RB_out = RB * surr_scale + R * rb_ext
 
+        # Pan extension moves energy INTO the surrounds — take the same
+        # energy back OUT of the front so the source travels rather than
+        # duplicating (constant-power complement).
+        if ls_ext > 0.0:
+            FL = FL * float(np.sqrt(max(0.0, 1.0 - ls_ext * ls_ext)))
+        if rs_ext > 0.0:
+            FR = FR * float(np.sqrt(max(0.0, 1.0 - rs_ext * rs_ext)))
+
         return {
-            "FL": L,
-            "FR": R,
+            "FL": FL,
+            "FR": FR,
             "C":  C,
             "LS": LS,
             "RS": RS,
