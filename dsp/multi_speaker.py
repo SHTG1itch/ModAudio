@@ -26,7 +26,7 @@ listener (facing → swap) or away (away → no swap).
 Behind Spectral Coloring
 ------------------------
 A mild psychoacoustic filter is applied to the rear bus:
-  +1.5 dB low shelf  @ 280 Hz  — bass fullness of a rear-wall boundary
+  +0.8 dB low shelf  @ 280 Hz  — bass fullness of a rear-wall boundary
   −3.0 dB high shelf @ 4 kHz   — pinna / HF shadowing from behind
 This helps the auditory system localise the rear speaker as coming from
 behind even when it is physically close to the listener.
@@ -45,7 +45,7 @@ input (N,2) float32
     ↓  _AdaptiveUpmix71       (FL, FR, C, LS, RS, LB, RB + coherence steering)
     ↓  VBAP routing matrix  → 4 bus outputs
     ↓  rear bus: behind-spectral coloring filter
-    ↓  PeakLimiter per bus
+    ↓  linked PeakLimiter (shared gain across buses)
 """
 
 from __future__ import annotations
@@ -57,6 +57,7 @@ from .reverb           import TheaterReverb
 from .dynamics         import MultibandCompressor, TransientEnhancer, PeakLimiter
 from .enhancer         import HarmonicBassEnhancer, AirBandExciter
 from .filters          import (make_lowpass, make_highpass,
+                               make_lr4_lowpass, make_lr4_highpass,
                                make_lowshelf, make_highshelf, FilterChain)
 from .surround_engine  import _AdaptiveUpmix71
 
@@ -93,10 +94,14 @@ def _vbap_sphere(src_az: float, src_el: float, spk_az_el_list: list) -> np.ndarr
     """
     Constant-power panning on a sphere using 3D great-circle angular distances.
 
-    Finds the two nearest speakers to the source by angular distance on the
-    unit sphere and interpolates with constant power between them.  Reduces to
-    the same result as a horizontal circle VBAP when all elevations are zero,
-    but correctly handles height speakers (e.g. Dolby Atmos overhead).
+    Picks the nearest speaker to the source, then the nearest speaker on the
+    OPPOSITE azimuth side of the source, and interpolates with constant power
+    between them.  Requiring the pair to bracket the source keeps the phantom
+    image on the correct side: a plain nearest-two choice can select two
+    speakers on the same side of the source, which pulls the image away from
+    the true direction instead of interpolating across it.  Falls back to the
+    two nearest speakers when no bracketing speaker exists (all speakers on
+    one side).  Correctly handles height speakers (e.g. Dolby Atmos overhead).
 
     src_az, src_el   : source azimuth/elevation in degrees
     spk_az_el_list   : list of (az_deg, el_deg) tuples — one per speaker
@@ -117,9 +122,25 @@ def _vbap_sphere(src_az: float, src_el: float, spk_az_el_list: list) -> np.ndarr
 
     dists = [_ang(az, el) for az, el in spk_az_el_list]
 
-    # Nearest pair
+    # Signed azimuth offset of each speaker from the source (−180..180)
+    def _signed_az(az):
+        return ((az - src_az + 180.0) % 360.0) - 180.0
+
     order = sorted(range(n), key=lambda i: dists[i])
-    i0, i1 = order[0], order[1]
+    i0 = order[0]
+    s0 = _signed_az(spk_az_el_list[i0][0])
+
+    # Partner: nearest speaker on the opposite azimuth side of the source
+    # (sign of azimuth offset differs from i0's), so the pair brackets it.
+    i1 = None
+    for j in order[1:]:
+        sj = _signed_az(spk_az_el_list[j][0])
+        if s0 == 0.0 or sj == 0.0 or (sj > 0) != (s0 > 0):
+            i1 = j
+            break
+    if i1 is None:
+        i1 = order[1]   # no bracketing speaker — fall back to second nearest
+
     d0, d1 = dists[i0], dists[i1]
     span = d0 + d1
 
@@ -390,7 +411,9 @@ class MultiSpeakerChain:
                  rear_az_deg: float = 150.0,
                  rear_direct_blend: float = 0.0,
                  front_info: tuple | None = None,
-                 rear_info:  tuple | None = None):
+                 rear_info:  tuple | None = None,
+                 front_eq=None,
+                 rear_eq=None):
         if preset is None:
             from config import HEADPHONES_PRESET
             preset = dict(HEADPHONES_PRESET)
@@ -435,15 +458,15 @@ class MultiSpeakerChain:
         self._trans = TransientEnhancer(
             fs=fs, amount=float(preset.get("transient_amount", 0.55)))
 
-        # -- Per-bus limiters -------------------------------------------------
+        # -- Linked limiter (one shared gain envelope for both buses, so
+        # limiting never shifts the front/rear level balance) -----------------
         thr = float(preset.get("limiter_threshold",  0.93))
         rel = float(preset.get("limiter_release_ms", 80.0))
-        self._lim_front = PeakLimiter(threshold=thr, release_ms=rel, fs=fs)
-        self._lim_rear  = PeakLimiter(threshold=thr, release_ms=rel, fs=fs)
+        self._limiter = PeakLimiter(threshold=thr, release_ms=rel, fs=fs)
 
-        # -- Sub-bass crossover -----------------------------------------------
-        self._lp_sub = make_lowpass(self._LO,  q=0.707, fs=fs, ch=2)
-        self._hp_mid = make_highpass(self._LO,  q=0.707, fs=fs, ch=2)
+        # -- Sub-bass crossover (LR4: sub + mid recombine flat, no 120 Hz notch)
+        self._lp_sub = make_lr4_lowpass(self._LO,  fs=fs, ch=2)
+        self._hp_mid = make_lr4_highpass(self._LO, fs=fs, ch=2)
 
         # -- Adaptive 7-channel upmix -----------------------------------------
         self._upmix = _AdaptiveUpmix71(fs)
@@ -468,6 +491,10 @@ class MultiSpeakerChain:
             make_lowshelf( 280.0, +0.8, q=0.707, fs=fs, ch=2),
             make_highshelf(4000.0, -3.0, q=0.707, fs=fs, ch=2),
         ])
+
+        # Per-bus custom EQ (ParametricEQ | None) — applied before the limiter.
+        self._front_eq = front_eq
+        self._rear_eq  = rear_eq
 
         # Normalization divisors — calibrated from steady-state RMS testing.
         # fn=1.5 rn=1.2 gives gain_vs_in ≈ -3.3 dB with +4.5 dB output_gain_db,
@@ -556,9 +583,14 @@ class MultiSpeakerChain:
         front = np.stack([front_L, front_R], axis=1).astype(np.float32)
         rear  = np.stack([rear_L,  rear_R],  axis=1).astype(np.float32)
 
-        # Per-bus limiting
-        front = self._lim_front.process(front)
-        rear  = self._lim_rear.process(rear)
+        # Per-bus custom EQ (before limiter)
+        if self._front_eq is not None:
+            front = self._front_eq.process(front)
+        if self._rear_eq is not None:
+            rear  = self._rear_eq.process(rear)
+
+        # Linked limiting: shared gain preserves the front/rear spatial balance
+        front, rear = self._limiter.process_linked([front, rear])
 
         return front, rear
 
@@ -567,6 +599,13 @@ class MultiSpeakerChain:
     def set_bass_priority(self, priority: str):
         """Update bass priority at runtime ('equal', 'front', 'rear')."""
         self._bass_priority = priority
+
+    def set_bus_eq(self, side: str, eq) -> None:
+        """Attach a custom EQ to the front or rear bus.  Pass None to bypass."""
+        if side == "front":
+            self._front_eq = eq
+        elif side == "rear":
+            self._rear_eq = eq
 
     def update_rear_az(self, rear_az_deg: float):
         """Update rear speaker azimuth (legacy) and rebuild routing matrix."""
@@ -592,7 +631,7 @@ class MultiSpeakerChain:
 
     def reset(self):
         for stage in (self._bass_enh, self._air_exc, self._eq, self._reverb,
-                      self._comp, self._trans, self._lim_front, self._lim_rear,
+                      self._comp, self._trans, self._limiter,
                       self._lp_sub, self._hp_mid, self._rear_color):
             stage.reset()
         self._upmix.reset()
@@ -641,6 +680,7 @@ class MultiSpeakerChainN:
         speaker_face_azs:  list | None = None,
         speaker_face_els:  list | None = None,
         bass_priority: str = "equal",
+        speaker_eqs: list | None = None,
     ):
         if preset is None:
             from config import HEADPHONES_PRESET
@@ -696,18 +736,23 @@ class MultiSpeakerChainN:
         self._trans  = TransientEnhancer(
             fs=fs, amount=float(preset.get("transient_amount", 0.55)))
 
-        self._lp_sub = make_lowpass(self._LO,  q=0.707, fs=fs, ch=2)
-        self._hp_mid = make_highpass(self._LO, q=0.707, fs=fs, ch=2)
+        # LR4 crossover: sub + mid recombine flat (no 120 Hz notch)
+        self._lp_sub = make_lr4_lowpass(self._LO,  fs=fs, ch=2)
+        self._hp_mid = make_lr4_highpass(self._LO, fs=fs, ch=2)
         self._upmix  = _AdaptiveUpmix71(fs)
 
-        # ---- Per-bus limiters and behind-coloring filters ---------------
+        # ---- Linked limiter and behind-coloring filters -----------------
+        # One shared gain envelope across all N buses: limiting on one
+        # speaker never shifts the inter-speaker balance (spatial stability).
         thr = float(preset.get("limiter_threshold",  0.93))
         rel = float(preset.get("limiter_release_ms", 80.0))
-        self._limiters = [
-            PeakLimiter(threshold=thr, release_ms=rel, fs=fs)
-            for _ in range(self._N)
-        ]
+        self._limiter = PeakLimiter(threshold=thr, release_ms=rel, fs=fs)
         self._behind_filters = self._build_behind_filters(self._azimuths, fs)
+
+        # ---- Per-speaker custom EQ (ParametricEQ | None per speaker) ----
+        # speaker_eqs[i] corresponds to the i-th speaker in azimuths.
+        # Applied after behind-coloring and sub-bass mix, before the limiter.
+        self._speaker_eqs: list = list(speaker_eqs) if speaker_eqs else [None] * self._N
 
         # ---- Channel levels ---------------------------------------------
         self._lfe_level  = float(preset.get("lfe_level",      0.85))
@@ -866,11 +911,14 @@ class MultiSpeakerChainN:
             stereo[:, 0] += sub_contrib
             stereo[:, 1] += sub_contrib
 
-            # Per-bus limiter
-            stereo = self._limiters[i].process(stereo)
+            # Per-speaker custom EQ (applied before limiter)
+            if i < len(self._speaker_eqs) and self._speaker_eqs[i] is not None:
+                stereo = self._speaker_eqs[i].process(stereo)
+
             outputs.append(stereo)
 
-        return outputs
+        # Linked limiting: one shared gain envelope across all buses
+        return self._limiter.process_linked(outputs)
 
     # ---- Runtime updates ------------------------------------------------
 
@@ -901,12 +949,6 @@ class MultiSpeakerChainN:
 
         if n_new != self._N:
             self._N = n_new
-            thr    = self._limiters[0]._threshold if self._limiters else 0.93
-            rel_ms = 80.0
-            self._limiters = [
-                PeakLimiter(threshold=thr, release_ms=rel_ms, fs=self._fs)
-                for _ in range(self._N)
-            ]
             self._norm = 1.0 / max(1.0, math.sqrt(self._N / 2.0))
 
         self._behind_filters = self._build_behind_filters(self._azimuths, self._fs)
@@ -918,14 +960,23 @@ class MultiSpeakerChainN:
     def set_bass_priority(self, priority: str):
         self._bass_priority = priority
 
+    def set_speaker_eq(self, idx: int, eq) -> None:
+        """Attach a custom EQ to speaker at index idx.  Pass None to bypass."""
+        while len(self._speaker_eqs) <= idx:
+            self._speaker_eqs.append(None)
+        self._speaker_eqs[idx] = eq
+
+    def set_all_speaker_eqs(self, eqs: list) -> None:
+        """Replace the entire per-speaker EQ list."""
+        self._speaker_eqs = list(eqs) + [None] * max(0, self._N - len(eqs))
+
     def reset(self):
         for stage in (self._bass_enh, self._air_exc, self._eq, self._reverb,
                       self._comp, self._trans, self._lp_sub, self._hp_mid,
                       self._height_hp, self._height_shelf):
             stage.reset()
         self._upmix.reset()
-        for lim in self._limiters:
-            lim.reset()
+        self._limiter.reset()
         for f in self._behind_filters:
             if f is not None:
                 f.reset()
