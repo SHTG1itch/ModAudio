@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+eq_state.json
+pi_config.yaml
