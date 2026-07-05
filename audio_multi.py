@@ -405,11 +405,78 @@ class _DelayBuffer:
 
 
 # ---------------------------------------------------------------------------
+# Varispeed resampler (clock-drift servo)
+# ---------------------------------------------------------------------------
+
+class _Varispeed:
+    """
+    Phase-continuous linear-interpolation resampler used as a clock-drift
+    servo.  Each output device runs on its own crystal; without rate
+    correction the per-device ring buffers slowly fill (200 ms latency creep
+    + drop-out splice) or drain (periodic under-runs).  The proc thread
+    nudges each bus's resampling ratio a few hundred ppm at most — far below
+    audibility (1000 ppm ≈ 1.7 cents) — to hold the ring fill at its target.
+    """
+
+    def __init__(self, channels: int = 2):
+        self._ch    = channels
+        self._last  = np.zeros((1, channels), dtype=np.float32)
+        self._phase = 0.0     # fractional read position into [last | block]
+
+    def process(self, x: np.ndarray, ratio: float) -> np.ndarray:
+        """Resample block x by `ratio` (input samples per output sample)."""
+        n = len(x)
+        if n == 0:
+            return x
+        if ratio == 1.0 and self._phase == 0.0:
+            self._last = x[-1:].copy()
+            return x
+        buf = np.concatenate([self._last, x])          # positions 0..n
+        # Output positions in input-sample units; position 0 = previous
+        # block's final sample, position n = x[-1].
+        max_k = int(np.floor((n - self._phase) / ratio)) + 1
+        pos = self._phase + np.arange(max_k, dtype=np.float64) * ratio
+        pos = pos[pos <= n]
+        idx  = pos.astype(np.int64)
+        frac = (pos - idx).astype(np.float32)[:, None]
+        idx1 = np.minimum(idx + 1, n)
+        out = buf[idx] * (1.0 - frac) + buf[idx1] * frac
+        self._phase = float(pos[-1] + ratio - n) if len(pos) else self._phase - n
+        self._last  = x[-1:].copy()
+        return np.ascontiguousarray(out, dtype=np.float32)
+
+    def reset(self):
+        self._last[:] = 0.0
+        self._phase = 0.0
+
+
+def _boost_thread_priority() -> None:
+    """Raise the calling thread to pro-audio priority (Windows; no-op elsewhere)."""
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.SetThreadPriority(k32.GetCurrentThread(), 15)   # TIME_CRITICAL
+        try:
+            task_idx = ctypes.c_ulong(0)
+            ctypes.windll.avrt.AvSetMmThreadCharacteristicsW(
+                "Pro Audio", ctypes.byref(task_idx))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Multi-device stream
 # ---------------------------------------------------------------------------
 
-_RING_MS   = 200          # ring buffer depth in milliseconds
+_RING_MS   = 200          # ring buffer capacity in milliseconds
 _PROC_TIMEOUT = 0.05      # proc thread wait timeout (seconds)
+_TARGET_BLOCKS = 3        # output-ring fill target (blocks) — the actual
+                          # buffering latency; servo holds fill here
+_SERVO_TAU  = 5.0         # servo stiffness (seconds); steady-state error at
+                          # 100 ppm device drift ≈ 24 samples
+_SERVO_MAX  = 1.0e-3      # ±1000 ppm ratio clamp (≈1.7 cents, inaudible)
 
 
 class MultiDeviceStream:
@@ -538,6 +605,16 @@ class MultiDeviceStream:
         self._in_ring    = _AudioRingBuffer(ring_frames, channels=2)
         self._front_ring = _AudioRingBuffer(ring_frames, channels=2)
         self._rear_ring  = _AudioRingBuffer(ring_frames, channels=2)
+
+        # -- Clock-drift servo (one varispeed per output bus) --------------
+        self._fill_target = _TARGET_BLOCKS * block_size
+        self._front_vs    = _Varispeed(2)
+        self._rear_vs     = _Varispeed(2)
+        self._front_fill  = float(self._fill_target)
+        self._rear_fill   = float(self._fill_target)
+
+        # Set when an output stream dies unexpectedly (BT disconnect etc.)
+        self.device_error: str | None = None
 
         # -- Streams / threads --------------------------------------------
         self._lb_pa      = None   # pyaudiowpatch PyAudio instance
@@ -718,6 +795,7 @@ class MultiDeviceStream:
         call blocks for up to _PROC_TIMEOUT seconds waiting for data, so the
         thread exits cleanly within that window after stop() is called.
         """
+        _boost_thread_priority()
         bs = self._bs
 
         while not self._stop_event.is_set():
@@ -755,10 +833,30 @@ class MultiDeviceStream:
             sq3 = rear * rear
             self.raw_out_rear[:]  = np.sqrt([sq3[:, 0].mean(), sq3[:, 1].mean()])
 
-            # Write to output ring buffers
+            # Clock-drift servo + write to output ring buffers.  Each output
+            # device consumes on its own crystal; a varispeed per bus holds
+            # the ring fill at the target instead of letting it drain
+            # (under-runs) or creep to capacity (latency + drop splices).
             if self._mode == "dual" and self._front_ring is not None:
+                front = self._servo_bus(front, self._front_ring,
+                                        self._front_vs, "_front_fill")
                 self._front_ring.write(front)
+            rear = self._servo_bus(rear, self._rear_ring,
+                                   self._rear_vs, "_rear_fill")
             self._rear_ring.write(rear)
+
+    def _servo_bus(self, block, ring, vs, fill_attr):
+        """EMA the ring fill and varispeed the block toward the fill target."""
+        fill = 0.9 * getattr(self, fill_attr) + 0.1 * ring.available
+        setattr(self, fill_attr, fill)
+        err = (fill - self._fill_target) / (self._fs * _SERVO_TAU)
+        ratio = 1.0 + float(np.clip(err, -_SERVO_MAX, _SERVO_MAX))
+        # After a hard under-run the fill sits at ~0 — refill to the target
+        # in one (faded) step rather than clicking for half a minute.
+        if ring.available == 0 and fill < self._bs:
+            ring.prefill(self._fill_target)
+            setattr(self, fill_attr, float(self._fill_target))
+        return vs.process(block, ratio)
 
     # ------------------------------------------------------------------ #
     # Input callbacks (write to _in_ring)
@@ -818,23 +916,40 @@ class MultiDeviceStream:
     # Start / Stop
     # ------------------------------------------------------------------ #
 
+    def _make_finished_cb(self, which: str):
+        """Flag unexpected stream death (BT disconnect) so the UI can react."""
+        def _cb():
+            if self._running:
+                self.device_error = which
+        return _cb
+
     def start(self) -> None:
         """Open streams and start the processing thread."""
         if self._running:
             return
 
         self._stop_event.clear()
+        self.device_error = None
         self._in_ring.reset()
         self._front_ring.reset()
         self._rear_ring.reset()
         self._front_delay_buf.reset()
         self._rear_delay_buf.reset()
+        self._front_vs.reset()
+        self._rear_vs.reset()
+        # Prefill output rings to the servo target so playback starts at a
+        # known, small buffering latency instead of a random fill level.
+        self._front_ring.prefill(self._fill_target)
+        self._rear_ring.prefill(self._fill_target)
+        self._front_fill = float(self._fill_target)
+        self._rear_fill  = float(self._fill_target)
 
         # Query rear device channel count
         rear_info = sd.query_devices(self._rear_dev, "output")
         rear_ch   = min(int(rear_info["max_output_channels"]), 2)
-        # Use appropriate latency: Bluetooth devices need a higher buffer
-        rear_latency = "high" if self.rear_is_bt else "low"
+        # WASAPI shared mode: "low" works for Bluetooth endpoints too — the
+        # BT stack buffers downstream of WASAPI, so "high" only added latency.
+        rear_latency = "low"
 
         # ── Loopback mode ────────────────────────────────────────────────
         if self._mode == "loopback":
@@ -922,6 +1037,7 @@ class MultiDeviceStream:
                 dtype="float32",
                 callback=self._rear_out_cb,
                 latency=rear_latency,
+                finished_callback=self._make_finished_cb(self.rear_name),
             )
 
         # ── Rear-only mode ───────────────────────────────────────────────
@@ -945,6 +1061,7 @@ class MultiDeviceStream:
                 dtype="float32",
                 callback=self._rear_out_cb,
                 latency=rear_latency,
+                finished_callback=self._make_finished_cb(self.rear_name),
             )
 
         # ── Dual (Full Control) mode ─────────────────────────────────────
@@ -953,7 +1070,6 @@ class MultiDeviceStream:
             front_info = sd.query_devices(self._front_dev, "output")
             in_ch    = min(int(in_info["max_input_channels"]),    2)
             front_ch = min(int(front_info["max_output_channels"]), 2)
-            front_latency = "high" if self.front_is_bt else "low"
 
             self._sd_in = sd.InputStream(
                 samplerate=self._fs,
@@ -971,7 +1087,8 @@ class MultiDeviceStream:
                 channels=front_ch,
                 dtype="float32",
                 callback=self._front_out_cb,
-                latency=front_latency,
+                latency="low",
+                finished_callback=self._make_finished_cb(self.front_name),
             )
             self._rear_sd = sd.OutputStream(
                 samplerate=self._fs,
@@ -981,21 +1098,31 @@ class MultiDeviceStream:
                 dtype="float32",
                 callback=self._rear_out_cb,
                 latency=rear_latency,
+                finished_callback=self._make_finished_cb(self.rear_name),
             )
 
-        # ── Start streams ────────────────────────────────────────────────
-        if self._lb_stream is not None:
-            self._lb_stream.start_stream()
-        if self._sd_in is not None:
-            self._sd_in.start()
-        if self._front_sd is not None:
-            self._front_sd.start()
-        self._rear_sd.start()
+        # ── Start pipeline ───────────────────────────────────────────────
+        # Proc thread first so the output rings are being refilled from the
+        # moment the output callbacks begin draining the prefilled silence —
+        # starting outputs first guaranteed start-up under-runs and left the
+        # ring fill (i.e. the buffering latency) at a random level.
+        try:
+            self._stop_event.clear()
+            self._proc_thread = threading.Thread(
+                target=self._proc_loop, name="MultiSpeaker-DSP", daemon=True)
+            self._proc_thread.start()
 
-        # ── Start processing thread ──────────────────────────────────────
-        self._proc_thread = threading.Thread(
-            target=self._proc_loop, name="MultiSpeaker-DSP", daemon=True)
-        self._proc_thread.start()
+            if self._lb_stream is not None:
+                self._lb_stream.start_stream()
+            if self._sd_in is not None:
+                self._sd_in.start()
+            if self._front_sd is not None:
+                self._front_sd.start()
+            self._rear_sd.start()
+        except Exception:
+            self._running = True   # let stop() tear everything down
+            self.stop()
+            raise
 
         self._running = True
 
@@ -1171,6 +1298,14 @@ class MultiSpeakerStreamN:
         self._out_rings = [_AudioRingBuffer(ring_frames, channels=2)
                            for _ in range(self._N)]
 
+        # Clock-drift servo (one varispeed per output device)
+        self._fill_target = _TARGET_BLOCKS * block_size
+        self._vs    = [_Varispeed(2) for _ in range(self._N)]
+        self._fills = [float(self._fill_target)] * self._N
+
+        # Set when an output stream dies unexpectedly (BT disconnect etc.)
+        self.device_error: str | None = None
+
         # Streams / threads
         self._sd_in      = None
         self._sd_outs    = [None] * self._N
@@ -1301,7 +1436,26 @@ class MultiSpeakerStreamN:
     # ------------------------------------------------------------------ #
 
     def start(self) -> None:
+        if self._running:
+            return
+        try:
+            self._start_inner()
+        except Exception:
+            self._running = True   # let stop() tear down whatever started
+            self.stop()
+            raise
+
+    def _start_inner(self) -> None:
         self._stop_event.clear()
+        self.device_error = None
+        self._in_ring.reset()
+        for ring, vs in zip(self._out_rings, self._vs):
+            ring.reset()
+            vs.reset()
+            # Prefill to the servo target: playback starts at a known,
+            # small buffering latency instead of a random fill level.
+            ring.prefill(self._fill_target)
+        self._fills = [float(self._fill_target)] * self._N
 
         # ---- Capture stream (explicit input device) ----------------------
         try:
@@ -1330,6 +1484,14 @@ class MultiSpeakerStreamN:
             callback=_in_cb,
             latency="low",
         )
+
+        # ---- Processing thread (before outputs: rings refill from the
+        # moment the callbacks start draining the prefilled silence) -------
+        self._running     = True
+        self._proc_thread = threading.Thread(
+            target=self._proc_loop, daemon=True, name="ModAudio-ProcN")
+        self._proc_thread.start()
+
         self._sd_in.start()
 
         # ---- N output streams -------------------------------------------
@@ -1353,6 +1515,12 @@ class MultiSpeakerStreamN:
                         outdata[:, out_ch:] = 0.0
                 return _cb
 
+            def _make_finished_cb(idx):
+                def _cb():
+                    if self._running:
+                        self.device_error = self._names[idx]
+                return _cb
+
             out_sd = sd.OutputStream(
                 samplerate=self._fs,
                 blocksize=self._bs,
@@ -1361,17 +1529,13 @@ class MultiSpeakerStreamN:
                 dtype="float32",
                 callback=_make_out_cb(ring, i),
                 latency="low",
+                finished_callback=_make_finished_cb(i),
             )
             out_sd.start()
             self._sd_outs[i] = out_sd
 
-        # ---- Processing thread ------------------------------------------
-        self._running     = True
-        self._proc_thread = threading.Thread(
-            target=self._proc_loop, daemon=True, name="ModAudio-ProcN")
-        self._proc_thread.start()
-
     def _proc_loop(self) -> None:
+        _boost_thread_priority()
         while not self._stop_event.is_set():
             block = self._in_ring.read(self._bs, timeout=_PROC_TIMEOUT)
             if block is None:
@@ -1395,7 +1559,18 @@ class MultiSpeakerStreamN:
                 if i < len(self._dist_delay_samp):
                     delay += self._dist_delay_samp[i]
                 stereo = self._delay_bufs[i].process(stereo, delay)
-                self._out_rings[i].write(stereo)
+
+                # Clock-drift servo: hold each device's ring fill at target
+                ring = self._out_rings[i]
+                fill = 0.9 * self._fills[i] + 0.1 * ring.available
+                self._fills[i] = fill
+                err = (fill - self._fill_target) / (self._fs * _SERVO_TAU)
+                ratio = 1.0 + float(np.clip(err, -_SERVO_MAX, _SERVO_MAX))
+                if ring.available == 0 and fill < self._bs:
+                    ring.prefill(self._fill_target)
+                    self._fills[i] = float(self._fill_target)
+                stereo = self._vs[i].process(stereo, ratio)
+                ring.write(stereo)
 
     def stop(self) -> None:
         self._running = False
