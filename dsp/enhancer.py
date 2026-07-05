@@ -67,16 +67,28 @@ class HarmonicBassEnhancer:
 
         # Extract sub-bass
         self._lp = _StereoSOS(butter(4, cutoff/(fs/2), btype='low',  output='sos'))
-        # High-pass the saturation products to isolate NEW harmonics only
-        # (removes the fundamental so we don't double-amplify sub-bass)
-        self._hp_harm = _StereoSOS(butter(4, cutoff*1.2/(fs/2), btype='high', output='sos'))
+        # High-pass the saturation products to isolate NEW harmonics.
+        # Placed at 0.6x cutoff (72 Hz for the 120 Hz band): the 2nd harmonic
+        # of a 35-60 Hz fundamental lands at 70-120 Hz — right where small
+        # drivers start working — and a 1.2x cutoff HP was erasing it along
+        # with the fundamental.  The 20-50 Hz fundamental itself still sits
+        # >=1 octave below the knee (>=24 dB down), so sub-bass is not
+        # double-amplified in any audible way.
+        self._hp_harm = _StereoSOS(butter(4, cutoff*0.6/(fs/2), btype='high', output='sos'))
 
     def process(self, stereo: np.ndarray) -> np.ndarray:
         x   = stereo.astype(np.float64)
         sub = self._lp.process(x)                             # fundamental
 
-        # Soft-clip waveshaper: tanh(drive*x) / tanh(drive) -- range-preserving
-        saturated  = np.tanh(self._drive * sub) / self._tanh_drive
+        # Soft-clip waveshaper: tanh(drive*x) / tanh(drive) -- range-preserving.
+        # tanh is odd → 3rd/5th harmonics only.  The missing-fundamental
+        # illusion is strongest when CONSECUTIVE harmonics (2nd and 3rd)
+        # define the periodicity, so add an even x² term as well: for a
+        # 40 Hz fundamental it contributes the 80 Hz 2nd harmonic (its DC
+        # by-product is stripped by the HP-isolate along with the
+        # fundamental, which keeps only new content above the crossover).
+        saturated = (np.tanh(self._drive * sub) / self._tanh_drive
+                     + 0.35 * sub * sub)
 
         # Isolate harmonics: new content = saturated - original fundamental
         harmonics  = self._hp_harm.process(saturated - sub)  # only above cutoff

@@ -82,9 +82,12 @@ class _Band:
         self._gain_db = coef * self._gain_db + (1.0 - coef) * gr
 
         g = 10 ** (self._gain_db / 20.0) * self._makeup
-        # Linearly ramp the gain across the block to avoid zipper noise now that
-        # the (correctly fast) gain can change substantially block to block.
-        ramp = np.linspace(self._prev_g, g, n, dtype=np.float64)[:, None]
+        # Linearly ramp the gain across the block to avoid zipper noise now
+        # that the (correctly fast) gain can change substantially block to
+        # block.  Exclusive start: the previous block already ENDED at
+        # prev_g, so this block's first sample takes the first step.
+        ramp = np.linspace(self._prev_g, g, n + 1,
+                           dtype=np.float64)[1:, None]
         self._prev_g = g
         return band * ramp
 

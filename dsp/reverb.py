@@ -71,6 +71,32 @@ _FDN_DELAYS = np.array(
 )
 
 
+def _next_prime(n: int) -> int:
+    """Smallest prime >= n (for fs-scaled FDN delays: primes are coprime)."""
+    n = max(2, int(n))
+    while True:
+        if n % 2 == 1 or n == 2:
+            for p in range(3, int(n ** 0.5) + 1, 2):
+                if n % p == 0:
+                    break
+            else:
+                if n == 2 or n % 2 == 1:
+                    return n
+        n += 1
+
+
+def _fdn_delays_for_fs(fs: int) -> np.ndarray:
+    """Scale the 48 kHz delay pattern to fs, keeping the lengths coprime.
+
+    Without scaling, a 44.1 kHz stream would shift every mode/delay ~9 %
+    (30-110 ms pattern becomes 33-120 ms) and the modal density changes.
+    """
+    if fs == 48000:
+        return _FDN_DELAYS.copy()
+    return np.array([_next_prime(int(round(d * fs / 48000.0)))
+                     for d in _FDN_DELAYS], dtype=np.int64)
+
+
 # -- FDN Reverb ----------------------------------------------------------------
 
 class FDNReverb:
@@ -81,7 +107,7 @@ class FDNReverb:
     def __init__(self, rt60=1.3, rt60_hf=0.65, fs=48000):
         self._fs      = fs
         self._H       = _hadamard8()
-        self._delays  = _FDN_DELAYS.copy()
+        self._delays  = _fdn_delays_for_fs(fs)
         # Buffer must hold at least (max_delay + one block); otherwise the read
         # window for the deepest line wraps and the realized delay is wrong.
         bsize         = int(np.max(self._delays)) + _MAX_BLOCK + 1
@@ -137,6 +163,12 @@ class FDNReverb:
         inp   = x @ self._in_gain
         w_idx = np.arange(ptr, ptr + n, dtype=np.int64) % bsize
         buf[w_idx] = mixed + inp
+
+        # Denormal guard: during long silences the feedback loop decays
+        # toward denormal range, where x86 float ops run 10-100x slower.
+        # Flushing the damping states each block keeps the loop clean.
+        zi = self._flt_zi
+        zi[np.abs(zi) < 1e-30] = 0.0
 
         out       = filtered @ self._out_gain
         self._ptr = int((ptr + n) % bsize)

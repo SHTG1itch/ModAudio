@@ -169,9 +169,63 @@ _BT_KEYWORDS = (
 )
 
 
+# Strong keywords that are safe even when the OS query succeeds (a paired
+# device can be missing from the name-match if the endpoint label is odd).
+_BT_KEYWORDS_STRONG = (
+    "bluetooth", " bt ", "bt-", " bt)", "(bt", "le_", "hands-free",
+    "airpods",
+)
+
+# Cached result of the Windows paired-Bluetooth-device query
+_BT_NAMES_CACHE: set | None = None
+_BT_NAMES_LOADED = False
+
+
+def _load_bt_device_names() -> set | None:
+    """Query Windows for the friendly names of paired Bluetooth audio devices.
+
+    The audio endpoint name ("Speakers (JBL Charge 3 Stereo)") contains the
+    paired device's friendly name ("JBL Charge 3 Stereo"), so a substring
+    match against this list identifies Bluetooth endpoints authoritatively —
+    unlike keyword guessing, which flags 2.4 GHz "Wireless Headset" dongles
+    (sub-10 ms latency!) as Bluetooth and then delays the wrong speaker.
+    Returns None when the query is unavailable (non-Windows, no PowerShell).
+    """
+    import platform, subprocess
+    if platform.system() != "Windows":
+        return None
+    try:
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_PnPEntity -Filter "
+             "\"Service='BthA2dp' or Service='BthHFEnum' or Service='BthLEEnum'\" "
+             "| Select-Object -ExpandProperty Name"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        names = {ln.strip().lower() for ln in res.stdout.splitlines()
+                 if len(ln.strip()) >= 4}
+        return names or None
+    except Exception:
+        return None
+
+
 def is_bluetooth_device(device_name: str) -> bool:
-    """Return True if the device name suggests Bluetooth / wireless audio."""
+    """Return True if the device is (very likely) a Bluetooth audio endpoint.
+
+    Prefers the OS's paired-device list (cached, one query per process);
+    falls back to name keywords when that is unavailable.
+    """
+    global _BT_NAMES_CACHE, _BT_NAMES_LOADED
     nl = device_name.lower()
+    if not _BT_NAMES_LOADED:
+        _BT_NAMES_CACHE = _load_bt_device_names()
+        _BT_NAMES_LOADED = True
+    if _BT_NAMES_CACHE is not None:
+        if any(bt in nl for bt in _BT_NAMES_CACHE):
+            return True
+        # OS list available and no match → only the strong keywords apply
+        # (avoids 'wireless'/'headset' false positives on 2.4 GHz dongles)
+        return any(kw in nl for kw in _BT_KEYWORDS_STRONG)
     return any(kw in nl for kw in _BT_KEYWORDS)
 
 
