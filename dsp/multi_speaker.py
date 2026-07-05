@@ -496,6 +496,10 @@ class MultiSpeakerChain:
         self._front_eq = front_eq
         self._rear_eq  = rear_eq
 
+        # Per-bus user gains — applied BEFORE the limiter so a boosted bus
+        # is still peak-controlled at the device (post-limiter gain can clip).
+        self._bus_gains = [1.0, 1.0]   # [front, rear]
+
         # Normalization divisors — calibrated from steady-state RMS testing.
         # fn=1.5 rn=1.2 gives gain_vs_in ≈ -3.3 dB with +4.5 dB output_gain_db,
         # and rear/front ≈ -7.8 dB (rear slightly quieter, as expected for a
@@ -589,6 +593,12 @@ class MultiSpeakerChain:
         if self._rear_eq is not None:
             rear  = self._rear_eq.process(rear)
 
+        # Per-bus user gains — pre-limiter so boosts can't clip the endpoint
+        if self._bus_gains[0] != 1.0:
+            front = front * self._bus_gains[0]
+        if self._bus_gains[1] != 1.0:
+            rear = rear * self._bus_gains[1]
+
         # Linked limiting: shared gain preserves the front/rear spatial balance
         front, rear = self._limiter.process_linked([front, rear])
 
@@ -606,6 +616,10 @@ class MultiSpeakerChain:
             self._front_eq = eq
         elif side == "rear":
             self._rear_eq = eq
+
+    def set_bus_gains(self, front_gain: float, rear_gain: float) -> None:
+        """Set per-bus user gains (applied before the linked limiter)."""
+        self._bus_gains = [float(front_gain), float(rear_gain)]
 
     def update_rear_az(self, rear_az_deg: float):
         """Update rear speaker azimuth (legacy) and rebuild routing matrix."""
@@ -753,6 +767,10 @@ class MultiSpeakerChainN:
         # speaker_eqs[i] corresponds to the i-th speaker in azimuths.
         # Applied after behind-coloring and sub-bass mix, before the limiter.
         self._speaker_eqs: list = list(speaker_eqs) if speaker_eqs else [None] * self._N
+
+        # ---- Per-speaker output gains (user volume × distance match) ----
+        # Applied BEFORE the linked limiter so boosted buses can't clip.
+        self._out_gains: list = [1.0] * self._N
 
         # ---- Channel levels ---------------------------------------------
         self._lfe_level  = float(preset.get("lfe_level",      0.85))
@@ -915,6 +933,11 @@ class MultiSpeakerChainN:
             if i < len(self._speaker_eqs) and self._speaker_eqs[i] is not None:
                 stereo = self._speaker_eqs[i].process(stereo)
 
+            # Per-speaker output gain — pre-limiter so boosts can't clip
+            g = self._out_gains[i] if i < len(self._out_gains) else 1.0
+            if g != 1.0:
+                stereo = stereo * g
+
             outputs.append(stereo)
 
         # Linked limiting: one shared gain envelope across all buses
@@ -950,6 +973,11 @@ class MultiSpeakerChainN:
         if n_new != self._N:
             self._N = n_new
             self._norm = 1.0 / max(1.0, math.sqrt(self._N / 2.0))
+            # Resize per-speaker EQ / gain lists to the new count
+            self._speaker_eqs = (self._speaker_eqs[:n_new]
+                                 + [None] * max(0, n_new - len(self._speaker_eqs)))
+            self._out_gains = (self._out_gains[:n_new]
+                               + [1.0] * max(0, n_new - len(self._out_gains)))
 
         self._behind_filters = self._build_behind_filters(self._azimuths, self._fs)
 
@@ -969,6 +997,11 @@ class MultiSpeakerChainN:
     def set_all_speaker_eqs(self, eqs: list) -> None:
         """Replace the entire per-speaker EQ list."""
         self._speaker_eqs = list(eqs) + [None] * max(0, self._N - len(eqs))
+
+    def set_output_gains(self, gains: list) -> None:
+        """Set per-speaker output gains (applied before the linked limiter)."""
+        gs = [float(g) for g in gains]
+        self._out_gains = gs[:self._N] + [1.0] * max(0, self._N - len(gs))
 
     def reset(self):
         for stage in (self._bass_enh, self._air_exc, self._eq, self._reverb,

@@ -203,6 +203,9 @@ def _estimate_codec_ms(device_name: str) -> float:
 # Thread-safe ring buffer
 # ---------------------------------------------------------------------------
 
+_FADE_LEN = 64   # samples (~1.3 ms at 48 kHz) — fade length for under-run edges
+
+
 class _AudioRingBuffer:
     """
     Thread-safe single-writer / single-reader ring buffer for float32 audio.
@@ -223,6 +226,11 @@ class _AudioRingBuffer:
         self._rpos  = 0
         self._avail = 0
         self._cond  = threading.Condition(threading.Lock())
+        # Output-side fade state (single reader) — see read_out()
+        self._flowing  = False
+        self._last_out = np.zeros(channels, dtype=np.float32)
+        self.underruns = 0
+        self.overruns  = 0
 
     # -- writer side (called from audio callback thread) -------------------
 
@@ -234,11 +242,14 @@ class _AudioRingBuffer:
             if n > self._cap:
                 data = data[-self._cap:]
                 n = self._cap
-            # Drop oldest if needed
+            # Drop oldest if needed.  The reader-side fade state is cleared
+            # so the splice point is faded back in rather than clicking.
             if self._avail + n > self._cap:
                 drop = self._avail + n - self._cap
                 self._rpos  = (self._rpos + drop) % self._cap
                 self._avail -= drop
+                self.overruns += 1
+                self._flowing = False
             s1 = min(n, self._cap - self._wpos)
             self._buf[self._wpos:self._wpos + s1] = data[:s1]
             if s1 < n:
@@ -278,10 +289,56 @@ class _AudioRingBuffer:
                 return None
             return self._read_locked(n)
 
+    def read_out(self, n: int) -> np.ndarray:
+        """
+        Non-blocking read for output callbacks: always returns exactly n
+        frames.  If fewer are buffered, the shortfall is zero-padded and the
+        valid→silence and silence→valid transitions are faded over
+        _FADE_LEN samples so under-runs never produce a hard click.
+        """
+        with self._cond:
+            take = min(self._avail, n)
+            data = self._read_locked(take) if take > 0 else None
+
+        out = np.zeros((n, self._ch), dtype=np.float32)
+        fade = _FADE_LEN
+        if data is not None:
+            out[:take] = data
+
+        if take > 0 and not self._flowing:
+            # First audio after silence / an under-run / a writer drop:
+            # fade the new audio in.
+            f = min(fade, take)
+            out[:f] *= np.linspace(0.0, 1.0, f, dtype=np.float32)[:, None]
+
+        if take < n:
+            # Entering (or continuing) an under-run
+            self.underruns += 1
+            if take > 0:
+                # Fade out the tail of the valid audio into the silence
+                f = min(fade, take)
+                out[take - f:take] *= np.linspace(1.0, 0.0, f,
+                                                  dtype=np.float32)[:, None]
+            elif self._flowing:
+                # No data at all but we were mid-signal: ramp the previous
+                # sample down to zero instead of cutting instantly.
+                f = min(fade, n)
+                out[:f] = self._last_out[None, :] * np.linspace(
+                    1.0, 0.0, f, dtype=np.float32)[:, None]
+            self._flowing = False
+        else:
+            self._flowing = True
+            self._last_out = out[-1].copy()
+        return out
+
     @property
     def available(self) -> int:
         with self._cond:
             return self._avail
+
+    def prefill(self, frames: int) -> None:
+        """Write `frames` of silence (used to establish the target latency)."""
+        self.write(np.zeros((frames, self._ch), dtype=np.float32))
 
     def reset(self) -> None:
         with self._cond:
@@ -289,6 +346,8 @@ class _AudioRingBuffer:
             self._wpos  = 0
             self._rpos  = 0
             self._avail = 0
+        self._flowing  = False
+        self._last_out = np.zeros(self._ch, dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -296,29 +355,53 @@ class _AudioRingBuffer:
 # ---------------------------------------------------------------------------
 
 class _DelayBuffer:
-    """Ring-buffer delay line for stereo float32 blocks."""
+    """Ring-buffer delay line for stereo float32 blocks.
+
+    Incoming audio is ALWAYS written to the buffer (even at delay 0), so the
+    history is valid the moment the delay is raised.  When the requested
+    delay changes between blocks, the output crossfades from the old tap to
+    the new tap over one block instead of jumping the read pointer (which
+    would click / zipper while a delay slider is dragged).
+    """
 
     def __init__(self, max_delay_samples: int, channels: int = 2):
         size = max_delay_samples + 4096
         self._buf  = np.zeros((size, channels), dtype=np.float32)
         self._sz   = size
         self._ptr  = 0
+        self._cur_delay = None   # delay used for the previous block
+
+    def _read_tap(self, n: int, delay: int) -> np.ndarray:
+        r = np.arange(self._ptr - delay - n, self._ptr - delay,
+                      dtype=np.int64) % self._sz
+        return self._buf[r]
 
     def process(self, x: np.ndarray, delay: int) -> np.ndarray:
-        if delay == 0:
-            return x
         n = len(x)
         w = np.arange(self._ptr, self._ptr + n, dtype=np.int64) % self._sz
         self._buf[w] = x
-        r = np.arange(self._ptr - delay - n, self._ptr - delay,
-                      dtype=np.int64) % self._sz
-        out = self._buf[r].copy()
         self._ptr = int((self._ptr + n) % self._sz)
-        return out
+
+        if self._cur_delay is None:
+            self._cur_delay = delay
+
+        if delay == self._cur_delay:
+            if delay == 0:
+                return x
+            return self._read_tap(n, delay).copy()
+
+        # Delay changed — crossfade old tap → new tap across this block
+        old = self._read_tap(n, self._cur_delay)
+        new = self._read_tap(n, delay)
+        ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)[:, None]
+        out = old * (1.0 - ramp) + new * ramp
+        self._cur_delay = delay
+        return out.astype(np.float32)
 
     def reset(self):
         self._buf[:] = 0.0
         self._ptr = 0
+        self._cur_delay = None
 
 
 # ---------------------------------------------------------------------------
@@ -443,9 +526,11 @@ class MultiDeviceStream:
         self._front_dist_m = front_dist_m
         self._rear_dist_m  = rear_dist_m
 
-        # -- Per-bus gains ------------------------------------------------
+        # -- Per-bus gains — applied inside the chain, BEFORE the limiter,
+        # so a boosted bus is still peak-controlled at the device.
         self._front_gain   = float(front_gain)
         self._rear_gain    = float(rear_gain)
+        self._chain.set_bus_gains(self._front_gain, self._rear_gain)
         self._swap_rear_lr = swap_rear_lr
 
         # -- Ring buffers -------------------------------------------------
@@ -516,9 +601,11 @@ class MultiDeviceStream:
 
     def update_front_gain(self, gain: float) -> None:
         self._front_gain = float(gain)
+        self._chain.set_bus_gains(self._front_gain, self._rear_gain)
 
     def update_rear_gain(self, gain: float) -> None:
         self._rear_gain = float(gain)
+        self._chain.set_bus_gains(self._front_gain, self._rear_gain)
 
     def update_bass_priority(self, priority: str) -> None:
         self._chain.set_bass_priority(priority)
@@ -600,7 +687,7 @@ class MultiDeviceStream:
 
     def update_chain(self, preset: dict) -> None:
         old = self._chain
-        self._chain = MultiSpeakerChain(
+        new = MultiSpeakerChain(
             fs=self._fs, preset=preset,
             bass_priority=old._bass_priority if old is not None else "equal",
             rear_az_deg=old._rear_az_deg     if old is not None else 150.0,
@@ -609,6 +696,8 @@ class MultiDeviceStream:
             front_eq=old._front_eq           if old is not None else None,
             rear_eq=old._rear_eq             if old is not None else None,
         )
+        new.set_bus_gains(self._front_gain, self._rear_gain)
+        self._chain = new
 
     def update_speaker_eqs(self, front_eq, rear_eq) -> None:
         """Attach custom EQ objects to front/rear buses."""
@@ -647,17 +736,14 @@ class MultiDeviceStream:
                 print(f"[multi/dsp] {exc}")
                 continue
 
-            # Delay compensation: Bluetooth + acoustic distance alignment
+            # Delay compensation: Bluetooth + acoustic distance alignment.
+            # (Always run so the delay-line history stays valid and delay
+            # changes crossfade cleanly; gains are applied inside the chain
+            # before the limiter.)
             f_delay = self._front_comp_delay + self._front_dist_delay
             r_delay = self._rear_comp_delay  + self._rear_dist_delay
-            if f_delay > 0:
-                front = self._front_delay_buf.process(front, f_delay)
-            if r_delay > 0:
-                rear = self._rear_delay_buf.process(rear, r_delay)
-
-            # Apply gains
-            front = front * self._front_gain
-            rear  = rear  * self._rear_gain
+            front = self._front_delay_buf.process(front, f_delay)
+            rear  = self._rear_delay_buf.process(rear, r_delay)
 
             # Swap rear L/R if speaker faces listener
             if self._swap_rear_lr:
@@ -711,28 +797,22 @@ class MultiDeviceStream:
         """sounddevice front OutputStream callback — drains _front_ring."""
         if status:
             self.xruns += 1
-        block = self._front_ring.read_nb(frames)
-        if block is not None:
-            out_ch = min(outdata.shape[1], 2)
-            outdata[:, :out_ch] = block[:, :out_ch]
-            if outdata.shape[1] > out_ch:
-                outdata[:, out_ch:] = 0.0
-        else:
-            outdata[:] = 0.0
+        block = self._front_ring.read_out(frames)
+        out_ch = min(outdata.shape[1], 2)
+        outdata[:, :out_ch] = block[:, :out_ch]
+        if outdata.shape[1] > out_ch:
+            outdata[:, out_ch:] = 0.0
 
     def _rear_out_cb(self, outdata: np.ndarray, frames: int,
                      time_info, status) -> None:
         """sounddevice rear OutputStream callback — drains _rear_ring."""
         if status:
             self.xruns += 1
-        block = self._rear_ring.read_nb(frames)
-        if block is not None:
-            out_ch = min(outdata.shape[1], 2)
-            outdata[:, :out_ch] = block[:, :out_ch]
-            if outdata.shape[1] > out_ch:
-                outdata[:, out_ch:] = 0.0
-        else:
-            outdata[:] = 0.0
+        block = self._rear_ring.read_out(frames)
+        out_ch = min(outdata.shape[1], 2)
+        outdata[:, :out_ch] = block[:, :out_ch]
+        if outdata.shape[1] > out_ch:
+            outdata[:, out_ch:] = 0.0
 
     # ------------------------------------------------------------------ #
     # Start / Stop
@@ -1134,6 +1214,7 @@ class MultiSpeakerStreamN:
         if not distances or len(distances) != self._N:
             self._dist_delay_samp = [0] * self._N
             self._dist_gain       = [1.0] * self._N
+            self._push_gains()
             return
         ds = [max(0.1, float(d)) for d in distances]
         d_max = max(ds)
@@ -1144,6 +1225,7 @@ class MultiSpeakerStreamN:
         ]
         # Clamp so a speaker very close to the listener isn't muted entirely
         self._dist_gain = [max(0.25, d / d_max) for d in ds]
+        self._push_gains()
 
     def update_speakers(
         self,
@@ -1181,14 +1263,25 @@ class MultiSpeakerStreamN:
             bass_priority=old._bass_priority,
             speaker_eqs=list(old._speaker_eqs) if old._speaker_eqs else None,
         )
+        self._push_gains()
 
     def update_speaker_eqs(self, eqs: list) -> None:
         """Attach per-speaker custom EQ objects to the running chain."""
         if self._chain is not None:
             self._chain.set_all_speaker_eqs(eqs)
 
+    def _push_gains(self) -> None:
+        """Push user × distance gains into the chain (applied pre-limiter)."""
+        combined = [
+            (self._gains[i] if i < len(self._gains) else 1.0)
+            * (self._dist_gain[i] if i < len(self._dist_gain) else 1.0)
+            for i in range(self._N)
+        ]
+        self._chain.set_output_gains(combined)
+
     def update_gains(self, gains: list) -> None:
         self._gains = [float(g) for g in gains]
+        self._push_gains()
 
     def update_bass_priority(self, priority: str) -> None:
         self._chain.set_bass_priority(priority)
@@ -1196,10 +1289,12 @@ class MultiSpeakerStreamN:
     def update_front_gain(self, gain: float) -> None:
         if self._gains:
             self._gains[0] = float(gain)
+        self._push_gains()
 
     def update_rear_gain(self, gain: float) -> None:
         for i in range(1, len(self._gains)):
             self._gains[i] = float(gain)
+        self._push_gains()
 
     # ------------------------------------------------------------------ #
     # Start / stop
@@ -1219,10 +1314,9 @@ class MultiSpeakerStreamN:
             if status:
                 self.xruns += 1
             sq = indata * indata
-            self.raw_in = np.sqrt(np.array(
-                [sq[:, 0].mean(), sq[:, 1 if sq.shape[1] > 1 else 0].mean()],
-                dtype=np.float32,
-            ))
+            # In-place write: raw_in is aliased by UI meter code
+            self.raw_in[:] = np.sqrt(
+                [sq[:, 0].mean(), sq[:, 1 if sq.shape[1] > 1 else 0].mean()])
             block = (indata[:, :2] if indata.shape[1] >= 2
                      else np.column_stack([indata[:, 0]] * 2)).astype(np.float32)
             self._in_ring.write(block)
@@ -1252,18 +1346,11 @@ class MultiSpeakerStreamN:
                 def _cb(outdata, frames, time_info, status):
                     if status:
                         self.xruns += 1
-                    data = r.read_nb(frames)
-                    if data is None:
-                        outdata[:] = 0.0
-                    else:
-                        n = min(len(data), len(outdata))
-                        outdata[:n] = data[:n]
-                        if n < len(outdata):
-                            outdata[n:] = 0.0
-                        sq = data * data
-                        self.raw_out[idx] = np.sqrt(np.array(
-                            [sq[:, 0].mean(), sq[:, 1].mean()],
-                            dtype=np.float32))
+                    data = r.read_out(frames)
+                    out_ch = min(outdata.shape[1], 2)
+                    outdata[:, :out_ch] = data[:, :out_ch]
+                    if outdata.shape[1] > out_ch:
+                        outdata[:, out_ch:] = 0.0
                 return _cb
 
             out_sd = sd.OutputStream(
@@ -1298,16 +1385,16 @@ class MultiSpeakerStreamN:
                 continue
 
             for i, stereo in enumerate(buses):
-                gain = self._gains[i] if i < len(self._gains) else 1.0
-                if i < len(self._dist_gain):
-                    gain *= self._dist_gain[i]   # inverse-distance level match
-                stereo = stereo * gain
+                # Meter here (proc thread) rather than in the RT callback;
+                # in-place write keeps the raw_out_front/rear aliases valid.
+                sq = stereo * stereo
+                self.raw_out[i][:] = np.sqrt(
+                    [sq[:, 0].mean(), sq[:, 1].mean()])
                 # BT compensation + wavefront (distance) alignment delay
                 delay = self._delay_samp[i]
                 if i < len(self._dist_delay_samp):
                     delay += self._dist_delay_samp[i]
-                if delay > 0:
-                    stereo = self._delay_bufs[i].process(stereo, delay)
+                stereo = self._delay_bufs[i].process(stereo, delay)
                 self._out_rings[i].write(stereo)
 
     def stop(self) -> None:

@@ -156,6 +156,8 @@ chain = MultiSpeakerChain(fs=fs, preset=dict(HEADPHONES_PRESET),
 fake = _FakeStream()
 fake._chain = chain
 fake._fs = fs
+fake._front_gain = 1.0
+fake._rear_gain  = 1.0
 out = MultiDeviceStream.update_chain(fake, dict(SPEAKERS_PRESET))
 check("update_chain preserves placement",
       fake._chain._front_info == fi and fake._chain._rear_info == ri,
@@ -168,9 +170,16 @@ class _FakeN:
     _N = 3
     _fs = fs
     _max_delay = 24000
-MultiSpeakerStreamN._apply_distances(_FakeN, [2.0, 3.0, 4.0])
-d = _FakeN._dist_delay_samp
-g = _FakeN._dist_gain
+    _gains = [1.0, 1.0, 1.0]
+    _push_gains = MultiSpeakerStreamN._push_gains
+    class _chain:                       # noqa: N801 — stub
+        @staticmethod
+        def set_output_gains(gains):
+            pass
+fakeN = _FakeN()
+MultiSpeakerStreamN._apply_distances(fakeN, [2.0, 3.0, 4.0])
+d = fakeN._dist_delay_samp
+g = fakeN._dist_gain
 exp0 = round((4.0 - 2.0) / 343.0 * fs)
 check("Distance delays (nearest gets most)", d[0] == exp0 and d[2] == 0 and d[0] > d[1] > d[2],
       f"(delays={d} samples, expected first={exp0})")
