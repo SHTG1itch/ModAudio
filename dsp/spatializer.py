@@ -269,12 +269,12 @@ class StereoWidenerProcessor:
 
 # -- Factory -------------------------------------------------------------------
 
-def make_spatializer(preset):
+def make_spatializer(preset, fs: int = 48000):
     """Return the correct spatializer for the given preset mode."""
     mode = preset.get("mode", "headphones")
     if mode == "speakers":
-        return StereoWidenerProcessor(fs=48000, preset=preset)
+        return StereoWidenerProcessor(fs=fs, preset=preset)
     if mode in ("surround", "surround_mono"):
         from .surround_engine import make_virtual_surround
-        return make_virtual_surround(fs=48000, preset=preset)
-    return BinauralSurroundProcessor(fs=48000, preset=preset)
+        return make_virtual_surround(fs=fs, preset=preset)
+    return BinauralSurroundProcessor(fs=fs, preset=preset)

@@ -524,8 +524,9 @@ class MultiSpeakerChain:
 
         # Full-signal theater processing
         x = self._bass_enh.process(x)
-        x = self._air_exc.process(x)
         x = self._eq.process(x)
+        x = self._air_exc.process(x)    # post-EQ so the X-curve doesn't
+                                        # shave the added sparkle
         x = self._reverb.process(x)
         x = self._comp.process(x)
         x = self._trans.process(x)
@@ -850,8 +851,9 @@ class MultiSpeakerChainN:
 
         # Shared theater processing
         x = self._bass_enh.process(x)
-        x = self._air_exc.process(x)
         x = self._eq.process(x)
+        x = self._air_exc.process(x)    # post-EQ so the X-curve doesn't
+                                        # shave the added sparkle
         x = self._reverb.process(x)
         x = self._comp.process(x)
         x = self._trans.process(x)

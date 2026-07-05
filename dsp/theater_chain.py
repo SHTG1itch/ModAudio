@@ -109,7 +109,7 @@ class TheaterChain:
         self._eq = CinemaEqualizer(fs=fs, num_channels=2, preset=preset)
 
         # -- Spatialization ---------------------------------------------------
-        self._surround = make_spatializer(preset)
+        self._surround = make_spatializer(preset, fs=fs)
 
         # -- Room reverb ------------------------------------------------------
         self._reverb = TheaterReverb(fs=fs, preset=preset)
@@ -146,10 +146,11 @@ class TheaterChain:
         x = block.astype(np.float32, copy=False)
 
         x = self._bass_enh.process(x)   # harmonic bass synthesis
-        x = self._air_exc.process(x)    # air-band exciter
         x = self._eq.process(x)         # cinema X-curve EQ
         if self._custom_eq is not None:
             x = self._custom_eq.process(x)   # user custom EQ (on top of mode preset)
+        x = self._air_exc.process(x)    # air-band exciter (post-EQ so the
+                                        # X-curve doesn't shave the sparkle)
         x = self._surround.process(x)   # virtual surround / widening
         x = self._reverb.process(x)     # theater room acoustics
         x = self._comp.process(x)       # multi-band compression

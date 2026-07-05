@@ -110,6 +110,62 @@ SPEAKERS_PRESET = {
     "limiter_release_ms": 80.0,
 }
 
+# -- Theater DSP Preset - SINGLE SPEAKER ---------------------------------------
+#
+# One physical loudspeaker (surround_mono).  Tuned for a real speaker in a
+# real room — NOT the headphone preset it previously inherited:
+#   • X-curve rolloff nearly removed: the room already absorbs HF, and the
+#     ambience path low-passes its reflections; −6 dB on top made it muffled.
+#   • Bass boosts halved: +10.5 dB of cumulative LF shelving into one small
+#     driver guaranteed woofer distortion and limiter pumping.  Harmonic
+#     bass synthesis (the right tool for small drivers) stays.
+#   • Reverb cut hard: the mono renderer applies its own 12-tap room
+#     pattern; running the full FDN on top was two room simulations in
+#     series (mud, congested tail).
+
+SINGLE_SPEAKER_PRESET = {
+    "mode": "surround_mono",
+
+    # -- Room acoustics (light — reflections come from the mono renderer) ------
+    "rt60":                1.0,
+    "rt60_hf":             0.5,
+    "reverb_predelay_ms": 24.0,
+    "reverb_mix":          0.10,
+    "early_ref_mix":       0.08,
+
+    # -- Spatialization ---------------------------------------------------------
+    "stereo_width":   1.0,         # meaningless in mono — keep neutral
+    "surround_level": 0.72,
+    "center_level":   0.88,
+    "lfe_level":      0.85,
+    "rear_level":     0.60,
+    "mono_ambience":  0.90,        # S-derived room-pattern level
+
+    # -- EQ (gentle for a real room) --------------------------------------------
+    "sub_bass_hz":    30,
+    "sub_bass_db":    2.5,
+    "bass_boost_hz":  80,
+    "bass_boost_db":  3.0,
+    "presence_hz":    3500,
+    "presence_db":    2.0,
+    "xcurve_hz":      2000,
+    "xcurve_db":     -1.5,
+
+    # -- Harmonic enhancement ----------------------------------------------------
+    "bass_harm_drive":   2.2,
+    "bass_harm_level":   0.45,
+    "air_exciter_level": 0.15,
+
+    # -- Dynamics -----------------------------------------------------------------
+    "mb_compress_drive": 1.4,
+    "transient_amount":  0.50,
+
+    # -- Output --------------------------------------------------------------------
+    "output_gain_db":    -1.5,
+    "limiter_threshold":  0.93,
+    "limiter_release_ms": 80.0,
+}
+
 # Default preset alias
 THEATER_PRESET = HEADPHONES_PRESET
 

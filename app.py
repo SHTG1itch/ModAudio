@@ -22,7 +22,8 @@ import sounddevice as sd
 
 import json
 
-from config      import HEADPHONES_PRESET, SPEAKERS_PRESET, SAMPLE_RATE, BLOCK_SIZE
+from config      import (HEADPHONES_PRESET, SPEAKERS_PRESET,
+                         SINGLE_SPEAKER_PRESET, SAMPLE_RATE, BLOCK_SIZE)
 from audio_io    import find_default_devices
 from dsp         import TheaterChain, ParametricEQ
 from dsp.speaker_profiles import detect_speaker_profile
@@ -2703,8 +2704,8 @@ class ModAudioApp(ctk.CTk):
         "headphones":   "Binaural 5.1 HRTF — optimised for headphones",
         "speakers":     "Stereo widening + Haas depth — for a stereo speaker pair",
         "surround":     "Virtual 7.1 HRTF with elevation — headphones or speakers",
-        "surround_mono":"Virtual 7.1 upmix + room reflections collapsed to one speaker — "
-                        "select this for single-speaker surround simulation",
+        "surround_mono":"Clean direct sound + adaptive room-reflection ambience — "
+                        "select this for a single speaker",
     }
 
     def _on_mode_change(self, value):
@@ -2996,11 +2997,16 @@ class ModAudioApp(ctk.CTk):
 
     def _build_preset(self) -> dict:
         """Merge active preset + slider overrides + mode into a final preset dict."""
-        # headphones / surround / surround_mono all use HRTF rendering and need
-        # the speaker azimuth positions from HEADPHONES_PRESET.
+        # headphones / surround use HRTF rendering and need the speaker azimuth
+        # positions from HEADPHONES_PRESET.
+        # surround_mono has its own preset tuned for one real speaker in a room.
         # speakers uses SPEAKERS_PRESET (no HRTF; M/S widening + Haas depth).
-        use_hp = self._mode in ("headphones", "surround", "surround_mono")
-        base = dict(HEADPHONES_PRESET if use_hp else SPEAKERS_PRESET)
+        if self._mode == "surround_mono":
+            base = dict(SINGLE_SPEAKER_PRESET)
+        elif self._mode in ("headphones", "surround"):
+            base = dict(HEADPHONES_PRESET)
+        else:
+            base = dict(SPEAKERS_PRESET)
         base["mode"] = self._mode
         base.update(self._slider_vals)
         return base

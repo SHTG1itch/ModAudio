@@ -39,14 +39,11 @@ Virtual 7.1 speaker layout:
 
 VirtualSurroundMono  (mode = "surround_mono")
 ─────────────────────────────────────────────
-Works with a SINGLE physical speaker.
-
-  1. Runs full 7.1 binaural rendering above.
-  2. Sums L+R ears to mono — HRTF spectral coloring (pinna notches,
-     front/back cues) survives the mono collapse (Blauert 1997).
-  3. Adds six directional early reflections simulating left/right walls,
-     ceiling, and rear of a virtual cinema.  Even in mono the delay pattern
-     implies a large enveloping acoustic space (Haas / precedence effect).
+Works with a SINGLE physical speaker.  Direct/ambience architecture:
+clean mono direct sound (M), with the stereo difference signal (S) — the
+component a plain mono downmix discards — rendered as a predelayed,
+filtered room-reflection pattern whose level adapts to programme
+diffuseness.  See the class docstring for why HRTF-to-mono was abandoned.
 """
 
 from __future__ import annotations
@@ -331,67 +328,84 @@ class VirtualSurroundBinaural:
 
 class VirtualSurroundMono:
     """
-    Single-speaker virtual surround — improved for ~60-70 % surround impression.
+    Single-speaker spatial rendering — direct / ambience architecture.
 
-    Architecture
-    ------------
-    1. Full 7.1 binaural rendering via FullSphereHRTFRenderer.
-       HRTF spectral coloring (pinna notches, front/back notches, concha
-       resonance) survives the binaural→mono collapse and gives the auditory
-       system directional spectral cues (Blauert 1997).
+    Why not HRTF-to-mono?
+    ---------------------
+    The previous design rendered 7 virtual channels through per-ear HRTFs
+    and summed the ears to mono.  Under a mono sum that machinery provably
+    degenerates: each channel's ITD becomes a static comb filter (the ±110°
+    surrounds notched the midrange at ~900 Hz), the surround side content
+    and M/S width cancel algebraically, and foreign-pinna spectral notches
+    played through a loudspeaker pass through the listener's OWN pinna a
+    second time — perceived as EQ dips, not direction.
 
-    2. ITD-compensated mono collapse: instead of a naive (L+R)/2 that causes
-       comb-filtering at high frequencies, a short allpass crossfeed filter
-       smoothes the phase before summing, preserving more spectral content.
+    What actually creates spaciousness from one loudspeaker:
 
-    3. Twelve room-reflection taps covering three distance ranges:
-         Early (5–20 ms)   — room size perception, envelopment
-         Mid   (20–60 ms)  — spaciousness, front/back depth
-         Late  (60–130 ms) — reverb tail onset, large-space sensation
-       Each range uses a different LP cutoff (surface material model):
-         Early taps: fc = 5.5 kHz  (hard walls, less absorption)
-         Mid taps:   fc = 3.5 kHz
-         Late taps:  fc = 2.2 kHz  (carpets/seats, high HF absorption)
+    1. A clean, un-comb-filtered direct sound (M).  Dialog stays dry and
+       intelligible.
+    2. The stereo difference signal S = (L−R)/2 — exactly the component a
+       plain mono downmix throws away — rescued and rendered as a delayed,
+       filtered room-reflection pattern.  The temporal pattern (not phase
+       tricks) is what conveys envelopment from a single source.
+    3. Coherence-adaptive ambience: diffuse material (crowds, rain, music
+       reverb) also sends part of M into the room pattern; dry centred
+       material stays almost entirely direct.
 
-    4. Decorrelated side reflections: left-wall and right-wall taps are
-       phase-inverted relative to each other (±0.5 gain) which the mono
-       speaker reproduces as apparent width even without true stereo.
-
-    The combined effect reliably delivers 60-70 % of true surround impression
-    on a single speaker in a typical room.
+    Twelve reflection taps cover three ranges with material-dependent LP
+    (early 5.5 kHz / mid 3.5 kHz / late 2.2 kHz) after a 10 ms predelay
+    that keeps the direct sound perceptually separate (precedence effect).
+    Note: tap polarity variation only decides where comb notches land in
+    the ambience band — it is NOT a stereo-width mechanism in mono.
     """
 
-    # (delay_ms, gain, lp_cutoff_hz)
+    # (delay_ms after predelay, gain, lp_cutoff_hz)
     _ROOM_TAPS = [
         # Early reflections — hard boundary first-order
-        (  5.5,  0.28, 5500.0),   # floor / near-wall
-        ( 10.0,  0.30, 5500.0),   # left wall
-        ( 14.5, -0.28, 5500.0),   # right wall  (polarity inversion → width cue)
-        ( 18.0,  0.22, 5500.0),   # ceiling
+        (  5.5,  0.28, 5500.0),
+        ( 10.0,  0.30, 5500.0),
+        ( 14.5, -0.28, 5500.0),
+        ( 18.0,  0.22, 5500.0),
         # Mid reflections — secondary surfaces
-        ( 24.0,  0.18, 3500.0),   # rear wall
-        ( 31.0,  0.14, 3500.0),   # left rear corner
-        ( 37.0, -0.12, 3500.0),   # right rear corner (inverted)
-        ( 46.0,  0.10, 3500.0),   # ceiling + rear blend
+        ( 24.0,  0.18, 3500.0),
+        ( 31.0,  0.14, 3500.0),
+        ( 37.0, -0.12, 3500.0),
+        ( 46.0,  0.10, 3500.0),
         # Late reflections — reverb tail onset
-        ( 62.0,  0.08, 2200.0),   # far left
-        ( 78.0, -0.07, 2200.0),   # far right (inverted)
+        ( 62.0,  0.08, 2200.0),
+        ( 78.0, -0.07, 2200.0),
         ( 98.0,  0.05, 2200.0),
         (128.0,  0.04, 2200.0),
     ]
 
+    _PREDELAY_MS = 10.0    # direct-to-first-reflection gap (precedence)
+    _SMOOTH_TC   = 0.050   # analysis smoothing (s), as in _AdaptiveUpmix71
+    LO = 120.0             # sub-bass crossover (Hz)
+
     def __init__(self, fs: int = 48000, preset: dict | None = None):
-        self._binaural = VirtualSurroundBinaural(fs, preset)
+        p = preset or {}
         self._fs = fs
 
-        max_d = int(max(t for t, *_ in self._ROOM_TAPS) * fs / 1000) + 128
+        # LR4 crossover so sub + rest recombine flat
+        self._lp_sub = make_lr4_lowpass(self.LO,  fs=fs, ch=2)
+        self._hp_mid = make_lr4_highpass(self.LO, fs=fs, ch=2)
+
+        self._lfe_level = float(p.get("lfe_level", 0.85))
+        # Ambience send level (S-derived room pattern vs direct)
+        self._amb_level = float(p.get("mono_ambience", 0.90))
+        # How much diffuse M leaks into the ambience path
+        self._m_diffuse = 0.35
+
+        pre = self._PREDELAY_MS
+        self._delays = [int(round((pre + t) * fs / 1000.0))
+                        for t, _, _ in self._ROOM_TAPS]
+        self._gains  = [g for _, g, _ in self._ROOM_TAPS]
+
+        max_d = max(self._delays) + 128
         bsz   = max_d + 4096
         self._rbuf = np.zeros(bsz, dtype=np.float64)
         self._rptr = 0
         self._rsz  = bsz
-
-        self._delays = [int(round(t * fs / 1000)) for t, _, _ in self._ROOM_TAPS]
-        self._gains  = [g for _, g, _ in self._ROOM_TAPS]
 
         # Per-tap LP filters (surface absorption model)
         self._tap_lpf: list[_MonoFilter] = []
@@ -399,47 +413,66 @@ class VirtualSurroundMono:
             b, a = _lowpass_ba(fc, 0.707, float(fs))
             self._tap_lpf.append(_MonoFilter(b, a))
 
+        # Smoothed analysis state
+        self._pan = 0.0
+        self._coh = 0.7
+
     def process(self, stereo: np.ndarray) -> np.ndarray:
         """(N, 2) float32 → (N, 2) float32  [both channels identical: mono]"""
-        binaural = self._binaural.process(stereo)
+        sub  = self._lp_sub.process(stereo)
+        rest = self._hp_mid.process(stereo)
 
-        # Flat mono downmix.  The previous "allpass crossfeed" computed
-        #   0.3·(L+R) + 0.2·allpass(L+R),
-        # i.e. it operated on the SUM, so it could not fill the comb notches it
-        # was meant to smooth — it only added a spurious HF rolloff (≈ −4 dB at
-        # 12 kHz, −11 dB at 20 kHz) on top of the intended HRTF shaping. The
-        # HRTF spectral cues survive a plain mono sum (Blauert 1997), so sum
-        # the two ears flat.
-        L64 = binaural[:, 0].astype(np.float64)
-        R64 = binaural[:, 1].astype(np.float64)
-        mono = (L64 + R64) * 0.5
+        L = rest[:, 0].astype(np.float64)
+        R = rest[:, 1].astype(np.float64)
+        M = (L + R) * 0.5
+        S = (L - R) * 0.5
 
+        # --- Analysis: pan + coherence (smoothed) -------------------------
+        L_rms = float(np.sqrt(np.mean(L * L) + 1e-12))
+        R_rms = float(np.sqrt(np.mean(R * R) + 1e-12))
+        pan_raw = (R_rms - L_rms) / (R_rms + L_rms + 1e-12)
+        coh_raw = float(np.clip(
+            np.mean(L * R) / (L_rms * R_rms + 1e-12), 0.0, 1.0))
+        a = float(np.exp(-(len(L) / self._fs) / self._SMOOTH_TC))
+        self._pan = a * self._pan + (1.0 - a) * float(pan_raw)
+        self._coh = a * self._coh + (1.0 - a) * coh_raw
+        diffuseness = (1.0 - self._coh) * (1.0 - abs(self._pan))
+
+        # --- Ambience source: the S signal (lost in a plain mono sum)
+        # plus the diffuse share of M --------------------------------------
+        amb_src = S + M * (self._m_diffuse * diffuseness)
+
+        # --- Room reflection pattern on the AMBIENCE only ------------------
+        # (the direct sound stays un-comb-filtered)
         buf, sz, ptr = self._rbuf, self._rsz, self._rptr
-        n = len(mono)
+        n = len(amb_src)
         w_idx = np.arange(ptr, ptr + n, dtype=np.int64) % sz
-        buf[w_idx] = mono
+        buf[w_idx] = amb_src
 
         room = np.zeros(n, dtype=np.float64)
         for delay, gain, lpf in zip(self._delays, self._gains, self._tap_lpf):
-            # [ptr-delay, ptr-delay+n) realizes exactly `delay` samples (the old
-            # [ptr-delay-n, ptr-delay) added a full block to every reflection).
             r_idx = np.arange(ptr - delay, ptr - delay + n, dtype=np.int64) % sz
-            tap   = buf[r_idx] * gain
-            tap   = lpf.process(tap)
-            room += tap
-
+            room += lpf.process(buf[r_idx] * gain)
         self._rptr = int((ptr + n) % sz)
 
-        # Room mix level: 0.55 gives strong envelopment without muddying direct
-        out_mono = (mono + room * 0.55).astype(stereo.dtype)
+        # --- Mix: mono LFE + clean direct + ambience -----------------------
+        # 0.58 level-matches the headphones/binaural chain (measured with
+        # uncorrelated pink noise through the full TheaterChain) so switching
+        # modes doesn't jump loudness.
+        sub_m = (sub[:, 0] + sub[:, 1]).astype(np.float64) * 0.5 * self._lfe_level
+        out_mono = ((sub_m + M + room * self._amb_level) * 0.58
+                    ).astype(stereo.dtype)
         return np.stack([out_mono, out_mono], axis=1)
 
     def reset(self):
-        self._binaural.reset()
+        self._lp_sub.reset()
+        self._hp_mid.reset()
         self._rbuf[:] = 0.0
         self._rptr = 0
         for f in self._tap_lpf:
             f.reset()
+        self._pan = 0.0
+        self._coh = 0.7
 
 
 # ---------------------------------------------------------------------------
