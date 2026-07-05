@@ -542,6 +542,7 @@ _TARGET_BLOCKS = 3        # output-ring fill target (blocks) — the actual
 _SERVO_TAU  = 5.0         # servo stiffness (seconds); steady-state error at
                           # 100 ppm device drift ≈ 24 samples
 _SERVO_MAX  = 1.0e-3      # ±1000 ppm ratio clamp (≈1.7 cents, inaudible)
+_CHAIN_XFADE_BLOCKS = 3   # blocks to crossfade when a DSP chain is swapped
 
 
 class MultiDeviceStream:
@@ -699,6 +700,10 @@ class MultiDeviceStream:
         self.raw_out_front = np.zeros(2, dtype=np.float32)
         self.raw_out_rear  = np.zeros(2, dtype=np.float32)
 
+        # Chain-swap crossfade state (see update_chain)
+        self._old_chain  = None
+        self._xfade_left = 0
+
     # ------------------------------------------------------------------ #
     # Delay management
     # ------------------------------------------------------------------ #
@@ -814,6 +819,10 @@ class MultiDeviceStream:
             rear_eq=old._rear_eq             if old is not None else None,
         )
         new.set_bus_gains(self._front_gain, self._rear_gain)
+        # Crossfade old→new over a couple of blocks in the proc thread so the
+        # cold-state swap (empty reverb tail, filters at rest) doesn't click.
+        self._old_chain   = old
+        self._xfade_left  = _CHAIN_XFADE_BLOCKS
         self._chain = new
 
     def update_speaker_eqs(self, front_eq, rear_eq) -> None:
@@ -850,6 +859,19 @@ class MultiDeviceStream:
             chain = self._chain   # atomic GIL read
             try:
                 front, rear = chain.process(block)
+                # Crossfade from the old chain for a few blocks after a swap
+                if self._old_chain is not None and self._xfade_left > 0:
+                    of, orr = self._old_chain.process(block)
+                    k = self._xfade_left
+                    w0 = (k - 1) / _CHAIN_XFADE_BLOCKS   # old-chain end weight
+                    w1 = k / _CHAIN_XFADE_BLOCKS         # old-chain start weight
+                    ramp = np.linspace(w1, w0, len(block),
+                                       dtype=np.float32)[:, None]
+                    front = of * ramp + front * (1.0 - ramp)
+                    rear  = orr * ramp + rear * (1.0 - ramp)
+                    self._xfade_left -= 1
+                    if self._xfade_left <= 0:
+                        self._old_chain = None
             except Exception as exc:
                 print(f"[multi/dsp] {exc}")
                 continue
@@ -1346,6 +1368,10 @@ class MultiSpeakerStreamN:
         # Set when an output stream dies unexpectedly (BT disconnect etc.)
         self.device_error: str | None = None
 
+        # Chain-swap crossfade state (see update_chain)
+        self._old_chain  = None
+        self._xfade_left = 0
+
         # Streams / threads
         self._sd_in      = None
         self._sd_outs    = [None] * self._N
@@ -1439,6 +1465,9 @@ class MultiSpeakerStreamN:
             speaker_eqs=list(old._speaker_eqs) if old._speaker_eqs else None,
         )
         self._push_gains()
+        # Crossfade old→new so the cold-state swap doesn't click
+        self._old_chain  = old
+        self._xfade_left = _CHAIN_XFADE_BLOCKS
 
     def update_speaker_eqs(self, eqs: list) -> None:
         """Attach per-speaker custom EQ objects to the running chain."""
@@ -1582,6 +1611,20 @@ class MultiSpeakerStreamN:
                 continue
             try:
                 buses = self._chain.process(block)
+                # Crossfade from the old chain for a few blocks after a swap
+                if self._old_chain is not None and self._xfade_left > 0:
+                    old_buses = self._old_chain.process(block)
+                    k = self._xfade_left
+                    ramp = np.linspace(k / _CHAIN_XFADE_BLOCKS,
+                                       (k - 1) / _CHAIN_XFADE_BLOCKS,
+                                       len(block), dtype=np.float32)[:, None]
+                    n_common = min(len(buses), len(old_buses))
+                    buses = [old_buses[i] * ramp + buses[i] * (1.0 - ramp)
+                             if i < n_common else buses[i]
+                             for i in range(len(buses))]
+                    self._xfade_left -= 1
+                    if self._xfade_left <= 0:
+                        self._old_chain = None
             except Exception as exc:
                 print(f"[MultiSpeakerStreamN] DSP error: {exc}")
                 for ring in self._out_rings:
