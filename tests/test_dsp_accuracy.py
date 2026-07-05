@@ -201,5 +201,113 @@ fund_bin  = np.argmin(np.abs(fbins - 15000))
 alias_db = 20*np.log10(S[alias_bin] / S[fund_bin] + 1e-12)
 check("Exciter alias suppressed", alias_db < -60.0, f"(18 kHz alias at {alias_db:.1f} dBc)")
 
+# ---- 7. Ring buffer: faded under-runs, exact reads ---------------------------
+from audio_multi import _AudioRingBuffer, _DelayBuffer, _Varispeed
+
+rb = _AudioRingBuffer(4800, 2)
+rb.write(np.ones((256, 2), np.float32))
+o1 = rb.read_out(512)
+check("Ring read_out pads and fades",
+      o1.shape == (512, 2) and abs(o1[0, 0]) < 0.05
+      and np.all(o1[256:] == 0) and rb.underruns == 1)
+rb.write(np.ones((512, 2), np.float32))
+o2 = rb.read_out(512)
+check("Ring resume fades back in",
+      o2[0, 0] < 0.1 and abs(o2[-1, 0] - 1.0) < 1e-6)
+
+# ---- 8. Delay buffer: exact tap + crossfaded changes -------------------------
+db = _DelayBuffer(1000, 2)
+xd = np.arange(512, dtype=np.float32).reshape(-1, 1).repeat(2, 1)
+check("Delay 0 = identity", np.allclose(db.process(xd, 0), xd))
+db.process(xd + 512, 100)                        # crossfade block 0 -> 100
+y3 = db.process(xd + 1024, 100)                  # steady state
+check("Delay tap is exact (no hidden block offset)",
+      np.allclose(y3[:, 0], np.arange(1024 - 100, 1536 - 100)))
+y4 = db.process(xd + 1536, 200)                  # change: must be smooth
+check("Delay change crossfades (no click)",
+      np.abs(np.diff(y4[:, 0])).max() < 6.0,
+      f"(max step {np.abs(np.diff(y4[:, 0])).max():.2f})")
+
+# ---- 9. Varispeed servo resampler --------------------------------------------
+vs = _Varispeed(1)
+tot = sum(len(vs.process(np.zeros((512, 1), np.float32), 1.001))
+          for _ in range(100))
+check("Varispeed rate correct", abs(tot - 51200 / 1.001) < 6, f"(n={tot})")
+vs2 = _Varispeed(1)
+t0, chunks = 0, []
+for r in [1.0, 1.001, 0.999, 1.0005, 1.0] * 20:
+    t = (t0 + np.arange(512)) / fs
+    t0 += 512
+    chunks.append(vs2.process(
+        np.sin(2 * np.pi * 1000 * t).astype(np.float32).reshape(-1, 1), r))
+yv = np.concatenate(chunks)[:, 0]
+check("Varispeed is phase-continuous",
+      np.abs(np.diff(yv)).max() < 0.14,
+      f"(max step {np.abs(np.diff(yv)).max():.3f})")
+
+# ---- 10. Upmix: centre extraction + pan gating --------------------------------
+from dsp.surround_engine import _AdaptiveUpmix71
+
+up = _AdaptiveUpmix71(fs)
+mono_sig = rng.standard_normal(512).astype(np.float64) * 0.1
+res = up.process(np.stack([mono_sig, mono_sig], axis=1).astype(np.float32))
+# FL should be L - 0.5*C = 0.5*L for mono input
+check("Upmix subtracts centre from fronts",
+      np.allclose(res["FL"], mono_sig * 0.5, atol=1e-6)
+      and np.allclose(res["C"], mono_sig, atol=1e-6))
+
+up2 = _AdaptiveUpmix71(fs)
+hard_left = np.stack([mono_sig, np.zeros_like(mono_sig)], axis=1).astype(np.float32)
+for _ in range(30):                       # let pan/coh smoothing settle
+    r2 = up2.process(hard_left)
+ls_rms = float(np.sqrt(np.mean(r2["LS"] ** 2)))
+fl_rms = float(np.sqrt(np.mean(r2["FL"] ** 2)))
+check("Pan-gated coherence keeps hard-panned dry source out of surrounds",
+      ls_rms < fl_rms * 1.2, f"(LS {ls_rms:.4f} vs FL {fl_rms:.4f})")
+
+# ---- 11. Mono renderer: direct clean, S rescued -------------------------------
+from dsp.surround_engine import VirtualSurroundMono
+from config import SINGLE_SPEAKER_PRESET
+
+vmn = VirtualSurroundMono(fs=fs, preset=dict(SINGLE_SPEAKER_PRESET))
+xm = np.tile(rng.standard_normal((4800, 1)).astype(np.float32) * 0.1, (1, 2))
+ym_ = np.concatenate([vmn.process(xm[i:i+512]) for i in range(0, 4096, 512)])
+r_mono = float(np.sqrt((ym_ ** 2).mean()) / np.sqrt((xm ** 2).mean()))
+check("Mono renderer ~unity on correlated input (x0.58 level match)",
+      0.45 < r_mono < 0.75, f"(ratio {r_mono:.3f})")
+
+vmn.reset()
+sd_ = rng.standard_normal(4800).astype(np.float32) * 0.1
+xs_ = np.stack([sd_, -sd_], axis=1)
+ys_ = np.concatenate([vmn.process(xs_[i:i+512]) for i in range(0, 4096, 512)])
+r_side = float(np.sqrt((ys_ ** 2).mean()) / np.sqrt((xs_ ** 2).mean()))
+check("Mono renderer rescues side content (plain downmix = 0)",
+      r_side > 0.08, f"(ratio {r_side:.3f})")
+
+# ---- 12. Bass enhancer: consecutive harmonics ---------------------------------
+from dsp.enhancer import HarmonicBassEnhancer
+
+enh = HarmonicBassEnhancer(cutoff=120.0, drive=2.8, level=0.5, fs=fs)
+tt = np.arange(fs * 2) / fs
+x40 = np.stack([0.5 * np.sin(2 * np.pi * 40 * tt)] * 2, axis=1).astype(np.float32)
+yh_ = np.concatenate([enh.process(x40[i:i+512])
+                      for i in range(0, fs * 2 - 512, 512)])
+Yh = np.abs(np.fft.rfft(yh_[fs:, 0] * np.hanning(len(yh_) - fs)))
+fh = np.fft.rfftfreq(len(yh_) - fs, 1 / fs)
+def _db_at(freq):
+    return 20 * np.log10(Yh[np.argmin(np.abs(fh - freq))] + 1e-12)
+h2 = _db_at(80) - _db_at(40)
+h3 = _db_at(120) - _db_at(40)
+check("Bass enhancer: 2nd AND 3rd harmonics present",
+      h2 > -40 and h3 > -35, f"(H2 {h2:.1f} dBc, H3 {h3:.1f} dBc)")
+
+# ---- 13. FDN delays scale with fs ---------------------------------------------
+from dsp.reverb import _fdn_delays_for_fs
+d44 = _fdn_delays_for_fs(44100)
+d48 = _fdn_delays_for_fs(48000)
+check("FDN delays scale to 44.1 kHz",
+      np.all(np.abs(d44 / 44100 - d48 / 48000) < 0.001))
+
 print()
-print("ALL PASS" if ok else "SOME CHECKS FAILED")
+print("ALL PASS" if ok else "FAILURES PRESENT")
+sys.exit(0 if ok else 1)
