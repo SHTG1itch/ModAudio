@@ -199,6 +199,71 @@ def _estimate_codec_ms(device_name: str) -> float:
     return _DEFAULT_BT_CODEC_MS
 
 
+def measure_output_latency_ms(dev_idx: int, fs: int = 48000,
+                              block_size: int = 512) -> float:
+    """
+    Measure a device's WASAPI output latency (ms) on a briefly-started
+    stream, using the same latency class ('low') the app streams with.
+    Note: for Bluetooth endpoints this does NOT include the A2DP codec /
+    stack latency, which is invisible to WASAPI — callers add a codec
+    estimate on top for BT devices.
+    """
+    info = sd.query_devices(dev_idx, "output")
+    ch   = min(int(info["max_output_channels"]), 2)
+    try:
+        with sd.OutputStream(
+            samplerate=fs, blocksize=block_size, device=dev_idx,
+            channels=ch, dtype="float32", latency="low",
+        ) as st:
+            time.sleep(0.05)   # let the stream settle so .latency is real
+            return float(st.latency) * 1000.0
+    except Exception:
+        return float(info.get("default_low_output_latency", 0.05)) * 1000.0
+
+
+def estimate_bt_delay_ms(front_dev: int, rear_dev: int, mode: str = "dual",
+                         fs: int = 48000, block_size: int = 512,
+                         front_latency_ms: float | None = None,
+                         rear_latency_ms: float | None = None) -> float:
+    """
+    Estimate the Bluetooth compensation delay between two output devices
+    without constructing a DSP chain.  Uses measured (or caller-provided,
+    e.g. from live streams) WASAPI latencies plus a codec estimate for the
+    Bluetooth side.  Returns 0.0 when compensation is architecturally
+    impossible (loopback mode with a Bluetooth rear speaker).
+    """
+    devs = sd.query_devices()
+    front_name = devs[front_dev]["name"] if front_dev < len(devs) else ""
+    rear_name  = devs[rear_dev]["name"]  if rear_dev  < len(devs) else ""
+    front_bt = is_bluetooth_device(front_name)
+    rear_bt  = is_bluetooth_device(rear_name)
+
+    def _lat(dev, provided):
+        return provided if provided is not None else \
+            measure_output_latency_ms(dev, fs, block_size)
+
+    if mode in ("loopback", "rear_only"):
+        if rear_bt and not front_bt:
+            # Cannot delay the front (Windows owns it) — nothing to calibrate
+            return 0.0
+        if front_bt and not rear_bt:
+            # Delay the wired rear to match the BT front
+            rear_ms = _lat(rear_dev, rear_latency_ms)
+            front_ms = _lat(front_dev, front_latency_ms) \
+                + _estimate_codec_ms(front_name)
+            return max(0.0, front_ms - rear_ms)
+        return 0.0
+
+    # dual mode — we own both streams
+    front_ms = _lat(front_dev, front_latency_ms)
+    rear_ms  = _lat(rear_dev,  rear_latency_ms)
+    if front_bt:
+        front_ms += _estimate_codec_ms(front_name)
+    if rear_bt:
+        rear_ms += _estimate_codec_ms(rear_name)
+    return max(0.0, abs(rear_ms - front_ms))
+
+
 # ---------------------------------------------------------------------------
 # Thread-safe ring buffer
 # ---------------------------------------------------------------------------
@@ -707,56 +772,31 @@ class MultiDeviceStream:
     # Auto-calibration
     # ------------------------------------------------------------------ #
 
+    @property
+    def bt_compensation_possible(self) -> bool:
+        """False when the BT lag cannot be corrected (loopback + BT rear:
+        the front plays directly from Windows and cannot be delayed)."""
+        return not (self._mode in ("loopback", "rear_only")
+                    and self.rear_is_bt and not self.front_is_bt)
+
     def calibrate_bt_delay_ms(self) -> float:
         """
-        Estimate BT compensation delay from WASAPI-reported stream latencies.
+        Estimate BT compensation delay.  When the stream is running, the
+        actual open streams' reported latencies are used (matching the real
+        runtime configuration); otherwise test streams are opened with the
+        same settings.  A codec estimate is added for the Bluetooth side,
+        since A2DP latency is invisible to WASAPI.
         """
-        def measure_ms(dev_idx: int) -> float:
-            info = sd.query_devices(dev_idx, "output")
-            ch   = min(int(info["max_output_channels"]), 2)
-            try:
-                with sd.OutputStream(
-                    samplerate=self._fs,
-                    blocksize=self._bs,
-                    device=dev_idx,
-                    channels=ch,
-                    dtype="float32",
-                    latency="low",
-                ) as st:
-                    return float(st.latency) * 1000.0
-            except Exception:
-                return float(info.get("default_low_output_latency", 0.05)) * 1000.0
-
-        rear_ms = measure_ms(self._rear_dev)
-
-        if self._mode in ("loopback", "rear_only"):
-            if self.rear_is_bt:
-                wired_front_est = 15.0
-                diff = rear_ms - wired_front_est
-                if diff < 30.0:
-                    diff += _estimate_codec_ms(self.rear_name)
-                return max(0.0, diff)
-            elif self.front_is_bt:
-                front_ms = measure_ms(self._front_dev)
-                diff = front_ms - rear_ms
-                if diff < 30.0:
-                    diff += _estimate_codec_ms(self.front_name)
-                return max(0.0, diff)
-            else:
-                return max(0.0, rear_ms)
-
-        front_ms = measure_ms(self._front_dev)
-        if self.rear_is_bt and not self.front_is_bt:
-            diff = rear_ms - front_ms
-            if diff < 30.0:
-                diff += _estimate_codec_ms(self.rear_name)
-            return max(0.0, diff)
-        elif self.front_is_bt and not self.rear_is_bt:
-            diff = front_ms - rear_ms
-            if diff < 30.0:
-                diff += _estimate_codec_ms(self.front_name)
-            return max(0.0, diff)
-        return max(0.0, abs(rear_ms - front_ms))
+        front_lat = rear_lat = None
+        if self._running:
+            if self._front_sd is not None:
+                front_lat = float(self._front_sd.latency) * 1000.0
+            if self._rear_sd is not None:
+                rear_lat = float(self._rear_sd.latency) * 1000.0
+        return estimate_bt_delay_ms(
+            self._front_dev, self._rear_dev, mode=self._mode,
+            fs=self._fs, block_size=self._bs,
+            front_latency_ms=front_lat, rear_latency_ms=rear_lat)
 
     # ------------------------------------------------------------------ #
     # Chain rebuild

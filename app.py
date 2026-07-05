@@ -2044,8 +2044,10 @@ class ModAudioApp(ctk.CTk):
         d = self._ms_bt_delay
         if self._ms_mode in ("loopback", "rear_only"):
             if rear_bt and not front_bt:
-                comp = (f"Rear BT lag ≈ {d:.0f} ms — front plays immediately, "
-                        f"rear arrives {d:.0f} ms later.  Adjust delay slider to compensate.")
+                comp = ("⚠ Rear BT lag cannot be compensated in this mode: the "
+                        "front plays directly from Windows, so it cannot be "
+                        "delayed to match the Bluetooth rear.  Switch to Full "
+                        "Control (dual) mode to enable compensation.")
             elif front_bt and not rear_bt:
                 comp = (f"Rear (wired) will be delayed {d:.0f} ms to match "
                         "the BT front speaker.")
@@ -2062,6 +2064,18 @@ class ModAudioApp(ctk.CTk):
             else:
                 comp = "Both devices are wired — no Bluetooth delay compensation"
         self._ms_lbl_comp_dir.configure(text=comp)
+
+        # The slider/calibrate button are no-ops when compensation is
+        # architecturally impossible (loopback with a BT rear) — grey them
+        # out rather than letting the user turn a dead knob.
+        uncorrectable = (self._ms_mode in ("loopback", "rear_only")
+                         and rear_bt and not front_bt)
+        state = "disabled" if uncorrectable else "normal"
+        try:
+            self._ms_bt_slider.configure(state=state)
+            self._ms_btn_calibrate.configure(state=state)
+        except Exception:
+            pass
 
     # =======================================================================
     # Virtual device / driver handlers
@@ -2585,6 +2599,20 @@ class ModAudioApp(ctk.CTk):
                 text_color=C["danger"] if self._ms_stream.xruns > 0 else C["dim"],
             )
 
+            # Watchdog: an output stream died mid-session (BT disconnect…)
+            dead = getattr(self._ms_stream, "device_error", None)
+            if dead:
+                self._ms_stream.device_error = None
+                self._stop_multi()
+                try:
+                    self._ms_lbl_calib_status.configure(
+                        text=f"⚠ Output device stopped: {dead} — "
+                             "stream halted.  Reconnect the device and press "
+                             "Start again.",
+                        text_color=C["danger"])
+                except Exception:
+                    pass
+
             # Feed per-speaker stereo levels to room canvas for wave visualisation
             if self._room_canvas and self._ms_speakers:
                 # N-speaker stream: raw_out is a list of [left_rms, right_rms]
@@ -2865,18 +2893,17 @@ class ModAudioApp(ctk.CTk):
 
         def _worker():
             try:
-                # Create a temporary MultiDeviceStream just for calibration
-                from audio_multi import MultiDeviceStream as _MDS
-                tmp = _MDS(
-                    in_dev=self._ms_in_idx,
-                    front_dev=self._ms_front_idx,
-                    rear_dev=self._ms_rear_idx,
-                    fs=SAMPLE_RATE,
-                    block_size=BLOCK_SIZE,
-                    mode=self._ms_mode,
-                )
-                estimated_ms = tmp.calibrate_bt_delay_ms()
-                del tmp
+                if self._ms_running and self._ms_stream is not None and \
+                        hasattr(self._ms_stream, "calibrate_bt_delay_ms"):
+                    # Use the live streams' actual reported latencies
+                    estimated_ms = self._ms_stream.calibrate_bt_delay_ms()
+                else:
+                    from audio_multi import estimate_bt_delay_ms as _est
+                    estimated_ms = _est(
+                        self._ms_front_idx, self._ms_rear_idx,
+                        mode=self._ms_mode,
+                        fs=SAMPLE_RATE, block_size=BLOCK_SIZE,
+                    )
 
                 def _apply():
                     self._ms_bt_delay = estimated_ms
@@ -3087,9 +3114,14 @@ class ModAudioApp(ctk.CTk):
         # Dual-stream fallback: separate InputStream + OutputStream.
         # Needed when capture (e.g. Stereo Mix [MME]) and speaker (e.g. [WASAPI])
         # are on different host APIs that PortAudio cannot open as a single duplex.
-        import queue as _queue
-        self._dual_queue = _queue.SimpleQueue()
-        _q = self._dual_queue
+        # A bounded ring buffer (not an unbounded queue) connects them: the two
+        # devices run on independent clocks, so an unbounded queue slowly grows
+        # (latency creep) or starves (clicks).  The ring caps depth at ~8 blocks,
+        # drops oldest audio with a fade on overflow, and fades under-run edges.
+        from audio_multi import _AudioRingBuffer
+        self._dual_ring = _AudioRingBuffer(BLOCK_SIZE * 8, channels=2)
+        self._dual_ring.prefill(BLOCK_SIZE * 2)   # start at a known small latency
+        _ring = self._dual_ring
 
         def _in_cb(indata, frames, time_info, status):
             if status:
@@ -3110,7 +3142,7 @@ class ModAudioApp(ctk.CTk):
                 sq2 = result * result
                 self._raw_out = np.sqrt(
                     np.array([sq2[:, 0].mean(), sq2[:, 1].mean()], dtype=np.float32))
-                _q.put(result)
+                _ring.write(result)
                 self._blk_count += 1
             except Exception as exc:
                 print(f"[audio_in] {exc}")
@@ -3118,12 +3150,9 @@ class ModAudioApp(ctk.CTk):
         def _out_cb(outdata, frames, time_info, status):
             if status:
                 self._xruns += 1
-            try:
-                block = _q.get_nowait()
-            except Exception:
-                block = np.zeros((frames, 2), dtype=np.float32)
+            block = _ring.read_out(frames)
             out_ch_use = min(outdata.shape[1], 2)
-            outdata[:, :out_ch_use] = block[:frames, :out_ch_use]
+            outdata[:, :out_ch_use] = block[:, :out_ch_use]
             if outdata.shape[1] > out_ch_use:
                 outdata[:, out_ch_use:] = 0.0
 
