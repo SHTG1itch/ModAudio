@@ -1,5 +1,5 @@
 # ModAudio - Theater Experience for Your Speakers & Headphones
-DISLCAIMER: If it sounds too quiet, then change the volume of your speakers (like through the OS's volume control). ESPECIALLY ON WINDOWS.
+DISCLAIMER: If it sounds too quiet, raise the operating system or speaker volume, especially on Windows.
 
 Transform your audio playback into an immersive theater experience with **ModAudio**, a professional-grade DSP (Digital Signal Processing) application that brings cinema-quality surround sound to any speaker setup or headphones.
 
@@ -13,9 +13,9 @@ Transform your audio playback into an immersive theater experience with **ModAud
 
 ### 🎤 Dual Audio Mode Support
 
-#### Single Speaker Mode
-- Stereo playback through headphones or stereo speakers
-- Full theater DSP chain with binaural spatialization
+#### Single-Output Theater Mode
+- Dedicated renderers for headphones, a stereo speaker pair, surround virtualization, or one physical speaker
+- Clean direct sound plus adaptive room-reflection ambience in **1 Speaker** mode (no HRTF comb filtering)
 - Customizable reverb, width, bass, and dynamics
 - 4 theater presets (Cinema, IMAX, Dolby, Home)
 
@@ -84,7 +84,7 @@ Transform your audio playback into an immersive theater experience with **ModAud
 
 ### Step 1: Clone the Repository
 ```bash
-git clone https://github.com/yourusername/ModAudio.git
+git clone https://github.com/SHTG1itch/ModAudio.git
 cd ModAudio
 ```
 
@@ -133,23 +133,24 @@ See **CLI Reference** section below for all available options.
 
 ## Quick Start Guide
 
-### Single Speaker Mode (Headphones or Stereo Speakers)
+### Single-Output Theater Mode
 
 1. **Launch the app** — `python app.py`
 2. **Select your audio device** in the "Device" dropdown
-3. **Choose a theater preset** — Cinema (default), IMAX, Dolby, or Home
-4. **Adjust sliders** as desired:
+3. **Choose the output mode** — Headphones, Speakers (a stereo pair), Surround, or **1 Speaker** (one physical speaker)
+4. **Choose a theater preset** — Cinema (default), IMAX, Dolby, or Home
+5. **Adjust sliders** as desired:
    - **Reverb** — Room acoustics (0.3–2.5 seconds)
    - **Width** — Stereo field expansion (1.0–2.8×)
    - **Bass** — Sub-bass boost (0–12 dB)
    - **Dynamics** — Compression punch (1.0–2.2)
-5. **Click "Start"** to begin processing
-6. **Click "Stop"** to pause or switch devices
+6. **Click "Start"** to begin processing
+7. **Click "Stop"** to pause or switch devices
 
-**Single-speaker audio flow:**
+**Single-output audio flow:**
 ```
-Input Audio → Bass Enhancement → EQ → Reverb → Dynamics →
-Transient Enhancement → Binaural Rendering → Peak Limiting → Output
+Input Audio → Bass Enhancement → EQ → Selected Renderer → Reverb →
+Dynamics → Transient Enhancement → Peak Limiting → Output
 ```
 
 For **headphones**, you'll hear:
@@ -161,6 +162,8 @@ For **stereo speakers**, you'll hear:
 - Stereo image expansion via M/S widening and Haas-delay effects
 - Subtle surround illusion from time-domain processing
 - Warm, theatrical bass with compression-driven punch
+
+For **one physical speaker**, choose **1 Speaker**. It preserves the stereo-difference ambience as filtered room reflections while keeping dialogue on a clean mono direct path.
 
 ---
 
@@ -210,7 +213,7 @@ To route audio through two independent speakers, you need a **virtual audio loop
 **Native PulseAudio Loopback** (Built-in)
 - Linux systems typically have PulseAudio with built-in loopback modules
 - ModAudio can auto-detect and use `module-loopback`
-- No additional software required; zero latency
+- No additional software required; latency depends on the PulseAudio configuration
 
 ### Which Should I Use?
 
@@ -699,7 +702,7 @@ Turn a Pi 4/5 (or even a Pi Zero 2) into a dedicated cinema-DSP box for your liv
 
 ### Install on the Pi
 ```bash
-git clone https://github.com/<your-fork>/ModAudio.git
+git clone https://github.com/SHTG1itch/ModAudio.git
 cd ModAudio
 sudo apt install python3-pip portaudio19-dev
 pip install -r requirements.txt
@@ -1042,9 +1045,11 @@ ModAudio/
 │   ├── reverb.py          # FDN reverb + early reflections
 │   ├── dynamics.py        # Compressor, limiter, transient enhancer
 │   ├── enhancer.py        # Bass harmonics & air-band exciter
-│   ├── hrtf_processor.py  # Brown-Duda binaural HRTF
-│   ├── utils.py           # Helper functions
-│   └── lpc.py             # LPC-based spectral modeling
+│   ├── hrtf.py            # Brown-Duda binaural HRTF
+│   ├── hrtf_full.py       # Full pinna-aware HRTF renderer
+│   ├── spatializer.py     # Headphone and stereo-speaker renderers
+│   ├── theater_chain.py   # Master single-output DSP pipeline
+│   └── custom_eq.py       # User parametric EQ
 └── .gitignore
 ```
 
@@ -1064,7 +1069,7 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) file for 
 
 If you encounter bugs or unexpected behavior:
 
-1. **Check existing issues** — Search https://github.com/yourusername/ModAudio/issues to avoid duplicates
+1. **Check existing issues** — Search https://github.com/SHTG1itch/ModAudio/issues to avoid duplicates
 2. **Test with included presets** — Try the default presets (Cinema, IMAX, Dolby, Home) to isolate custom vs. preset issues
 3. **Review troubleshooting** — See the Troubleshooting section above for common solutions
 4. **Provide diagnostic information:**
@@ -1112,7 +1117,7 @@ Open a GitHub issue with tag `[Feature Request]` and describe your idea.
 **Setup for development:**
 
 ```bash
-git clone https://github.com/yourusername/ModAudio.git
+git clone https://github.com/SHTG1itch/ModAudio.git
 cd ModAudio
 git checkout -b feature/your-feature-name  # Create feature branch
 pip install -r requirements.txt
