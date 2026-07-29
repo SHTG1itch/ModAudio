@@ -55,19 +55,19 @@ Transform your audio playback into an immersive theater experience with **ModAud
 ## System Requirements
 
 ### Windows 10/11 (64-bit)
-- **Python 3.8+** (we recommend 3.11 or later)
+- **Python 3.10+** (we recommend 3.11 or later)
 - **~200 MB** disk space for dependencies
 - **Audio device** (headphones, speakers, or USB audio interface)
 - **Windows audio API** — WASAPI (Windows Audio Session API) for low-latency audio I/O
 
 ### macOS 10.13+ (Intel or Apple Silicon)
-- **Python 3.8+** (we recommend 3.11 or later)
+- **Python 3.10+** (we recommend 3.11 or later)
 - **~200 MB** disk space for dependencies
 - **Audio device** (headphones, speakers, or USB audio interface)
 - **Core Audio** — macOS native audio framework (built-in)
 
 ### Linux (Ubuntu 20.04+, Debian, Fedora)
-- **Python 3.8+** (we recommend 3.11 or later)
+- **Python 3.10+** (we recommend 3.11 or later)
 - **~200 MB** disk space for dependencies
 - **Audio device** (headphones, speakers, or USB audio interface)
 - **PulseAudio** or **ALSA** — Linux audio server (usually pre-installed)
@@ -702,7 +702,7 @@ Turn a Pi 4/5 (or even a Pi Zero 2) into a dedicated cinema-DSP box for your liv
 git clone https://github.com/<your-fork>/ModAudio.git
 cd ModAudio
 sudo apt install python3-pip portaudio19-dev
-pip install -r requirements.txt pyyaml
+pip install -r requirements.txt
 ```
 
 ### Configure Your Speaker Layout
@@ -787,7 +787,7 @@ Set `preset: Dolby` and add elevated speakers — e.g. a ceiling pair at `az: ±
    - **Linux:** `sudo apt update && sudo apt upgrade` (Debian/Ubuntu)
 
 #### App Crashes on Launch
-1. **Check Python version** — Ensure Python 3.8+ is installed (`python --version`)
+1. **Check Python version** — Ensure Python 3.10+ is installed (`python --version`)
 2. **Reinstall dependencies** — `pip install -r requirements.txt --force-reinstall`
 3. **Check for missing modules** — Run `python -c "import sounddevice; print('OK')"` to verify sound library
 
@@ -999,18 +999,18 @@ newgrp audio
 **Windows:**
 - Windows 10 22H2
 - Windows 11 Home & Pro
-- Python 3.9–3.12
+- Python 3.10–3.12
 
 **macOS:**
 - macOS 12.x, 13.x, 14.x (Intel)
 - macOS 13.x, 14.x (Apple Silicon M1/M2)
-- Python 3.9–3.12
+- Python 3.10–3.12
 
 **Linux:**
 - Ubuntu 20.04 LTS, 22.04 LTS
 - Debian 11, 12
 - Fedora 37, 38
-- Python 3.9–3.12
+- Python 3.10–3.12
 
 **Virtual Audio Devices:**
 - VB-Cable 4.x (Windows & macOS)
