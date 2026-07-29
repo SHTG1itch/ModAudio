@@ -14,6 +14,7 @@ Run:  python -m tests.test_rotation
 """
 from __future__ import annotations
 import os, sys, math
+import unittest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import numpy as np
@@ -222,6 +223,16 @@ def main():
             print(f"  ERROR: {type(e).__name__}: {e}")
     print(f"\n{'='*50}\n{len(tests)-failures}/{len(tests)} passed")
     sys.exit(1 if failures else 0)
+
+
+class TestRotation(unittest.TestCase):
+    test_driver_positions_2spk = staticmethod(test_driver_positions_2spk)
+    test_constant_power = staticmethod(test_constant_power)
+    test_rotation_2spk = staticmethod(test_rotation_2spk)
+    test_rotation_5spk_clockwise = staticmethod(test_rotation_5spk_clockwise)
+    test_user_rotation_scenario = staticmethod(test_user_rotation_scenario)
+    test_atmos_height_routing = staticmethod(test_atmos_height_routing)
+    test_atmos_graceful_degradation = staticmethod(test_atmos_graceful_degradation)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ Run directly:  python tests/test_dsp_accuracy.py
 """
 import os
 import sys
+import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
@@ -378,4 +379,10 @@ check("GUI preserves dedicated single-speaker staging",
 
 print()
 print("ALL PASS" if ok else "FAILURES PRESENT")
-sys.exit(0 if ok else 1)
+
+class TestDSPAccuracy(unittest.TestCase):
+    def test_all_checks(self):
+        self.assertTrue(ok)
+
+if __name__ == "__main__":
+    sys.exit(0 if ok else 1)
