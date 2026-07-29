@@ -34,6 +34,7 @@ Tweakable parameters (all optional)
 """
 
 import argparse
+import math
 import signal
 import sys
 import time
@@ -60,29 +61,45 @@ BANNER = r"""
 
 # -- CLI -----------------------------------------------------------------------
 
-def parse_args():
+def _bounded(name, minimum, maximum, cast=float):
+    def parse(value):
+        try:
+            number = cast(value)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(f"{name} must be a number") from None
+        if not math.isfinite(number) or not minimum <= number <= maximum:
+            raise argparse.ArgumentTypeError(
+                f"{name} must be between {minimum} and {maximum}")
+        return number
+    return parse
+
+
+def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="ModAudio: real-time theater audio processor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("-i", "--input",  type=int, default=None, metavar="DEV",
+    p.add_argument("-i", "--input",  type=_bounded("device", 0, 10000, int), default=None, metavar="DEV",
                    help="Input device index")
-    p.add_argument("-o", "--output", type=int, default=None, metavar="DEV",
+    p.add_argument("-o", "--output", type=_bounded("device", 0, 10000, int), default=None, metavar="DEV",
                    help="Output device index")
     p.add_argument("--list-devices", action="store_true",
                    help="Print all audio devices and exit")
     p.add_argument("--mode", choices=["headphones", "speakers"],
                    default="headphones",
                    help="headphones=binaural HRTF, speakers=stereo widening")
-    p.add_argument("--fs",         type=int,   default=SAMPLE_RATE)
-    p.add_argument("--block-size", type=int,   default=BLOCK_SIZE)
-    p.add_argument("--rt60",       type=float, default=None)
-    p.add_argument("--reverb-mix", type=float, default=None)
-    p.add_argument("--width",      type=float, default=None)
-    p.add_argument("--gain",       type=float, default=None)
-    p.add_argument("--drive",      type=float, default=None,
+    p.add_argument("--fs", type=_bounded("sample rate", 32000, 192000, int), default=SAMPLE_RATE)
+    p.add_argument("--block-size", type=_bounded("block size", 16, 4096, int), default=BLOCK_SIZE)
+    p.add_argument("--rt60", type=_bounded("RT60", 0.1, 10.0), default=None)
+    p.add_argument("--reverb-mix", type=_bounded("reverb mix", 0.0, 1.0), default=None)
+    p.add_argument("--width", type=_bounded("width", 0.0, 4.0), default=None)
+    p.add_argument("--gain", type=_bounded("gain", -60.0, 12.0), default=None)
+    p.add_argument("--drive", type=_bounded("drive", 1.0, 2.0), default=None,
                    help="Dynamics drive 1.0-2.0 (default: 1.6)")
-    return p.parse_args()
+    args = p.parse_args(argv)
+    if args.block_size > min(4096, int(args.fs * 0.03)):
+        p.error("block size must not exceed 30 ms at the selected sample rate")
+    return args
 
 
 def build_preset(args) -> dict:

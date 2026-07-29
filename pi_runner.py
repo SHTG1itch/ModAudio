@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import sys
@@ -160,6 +161,18 @@ def load_config(path: Path) -> dict:
 
 def validate_config(cfg: dict) -> dict:
     """Validate and fill defaults. Raises SystemExit on bad input."""
+    def number(value, name, cast=float, minimum=None, maximum=None):
+        try:
+            value = cast(value)
+        except (TypeError, ValueError):
+            sys.exit(f"{name} must be a number.")
+        if (not math.isfinite(value)
+                or minimum is not None and value < minimum
+                or maximum is not None and value > maximum):
+            bounds = f" between {minimum} and {maximum}" if maximum is not None else f" >= {minimum}"
+            sys.exit(f"{name} must be{bounds}.")
+        return value
+
     if not isinstance(cfg, dict):
         sys.exit("Config root must be a mapping/object.")
     speakers = cfg.get("speakers")
@@ -172,16 +185,36 @@ def validate_config(cfg: dict) -> dict:
             sys.exit(f"speakers[{i}] must be a mapping.")
         if "device" not in spk or "az" not in spk:
             sys.exit(f"speakers[{i}] must have `device` and `az`.")
+        spk["device"] = number(spk["device"], f"speakers[{i}].device", int, 0)
+        spk["az"] = number(spk["az"], f"speakers[{i}].az")
+        for key in ("el", "face_el"):
+            if key in spk:
+                spk[key] = number(spk[key], f"speakers[{i}].{key}", minimum=-90, maximum=90)
+        if "face_az" in spk:
+            spk["face_az"] = number(spk["face_az"], f"speakers[{i}].face_az")
+        if "gain" in spk:
+            spk["gain"] = number(spk["gain"], f"speakers[{i}].gain", minimum=0, maximum=4)
     cfg.setdefault("sample_rate",   SAMPLE_RATE)
     cfg.setdefault("block_size",    BLOCK_SIZE)
     cfg.setdefault("preset",        "Cinema")
     cfg.setdefault("bass_priority", "equal")
     cfg.setdefault("bt_delay_ms",   0.0)
+    cfg["sample_rate"] = number(cfg["sample_rate"], "sample_rate", int, 32000, 192000)
+    cfg["block_size"] = number(cfg["block_size"], "block_size", int, 16, 4096)
+    if cfg["block_size"] > min(4096, int(cfg["sample_rate"] * 0.03)):
+        sys.exit("block_size must not exceed 30 ms at the selected sample_rate.")
+    cfg["bt_delay_ms"] = number(cfg["bt_delay_ms"], "bt_delay_ms", minimum=0, maximum=500)
     if cfg["preset"] not in PRESETS:
         sys.exit(f"Unknown preset '{cfg['preset']}'. "
                  f"Choose from: {', '.join(PRESETS)}")
     if "input_device" not in cfg:
         sys.exit("Config must set `input_device` (use --list-devices to find it).")
+    cfg["input_device"] = number(cfg["input_device"], "input_device", int, 0)
+    if cfg["bass_priority"] not in ("equal", "front", "rear"):
+        sys.exit("bass_priority must be equal, front, or rear.")
+    devices = [speaker["device"] for speaker in speakers]
+    if len(devices) != len(set(devices)):
+        sys.exit("Each speaker must use a different output device.")
     return cfg
 
 

@@ -321,6 +321,29 @@ check("Mono devices receive a proper stereo downmix",
 check("Multichannel devices receive stereo only",
       np.allclose(multi_out[:, :2], stereo) and np.all(multi_out[:, 2:] == 0))
 
+# ---- 15. CLI/config trust-boundary validation ---------------------------------
+from main import parse_args
+from pi_runner import validate_config
+from contextlib import redirect_stderr
+from io import StringIO
+
+def rejects(call):
+    try:
+        with redirect_stderr(StringIO()):
+            call()
+        return False
+    except SystemExit:
+        return True
+
+check("CLI rejects invalid DSP parameters",
+      rejects(lambda: parse_args(["--fs", "0"]))
+      and rejects(lambda: parse_args(["--rt60", "0"]))
+      and rejects(lambda: parse_args(["--block-size", "999999"])))
+bad_pi = {"input_device": 0, "sample_rate": "bad", "speakers": [
+    {"device": 1, "az": 0}, {"device": 2, "az": 30}]}
+check("Pi config rejects invalid DSP parameters",
+      rejects(lambda: validate_config(bad_pi)))
+
 print()
 print("ALL PASS" if ok else "FAILURES PRESENT")
 sys.exit(0 if ok else 1)
