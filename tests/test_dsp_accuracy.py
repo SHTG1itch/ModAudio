@@ -364,6 +364,18 @@ check("Single-output chain swaps crossfade without a jump",
       fade[0][0, 0] == 1.0 and fade[-1][-1, 0] == -1.0
       and state._chain_transition is None)
 
+# ---- 17. Dedicated single-speaker staging ------------------------------------
+from app import PRESETS
+
+state._mode = "surround_mono"
+state._slider_vals = dict(PRESETS["Cinema"])
+mono_preset = ModAudioApp._build_preset(state)
+check("GUI preserves dedicated single-speaker staging",
+      mono_preset["reverb_mix"] == SINGLE_SPEAKER_PRESET["reverb_mix"]
+      and mono_preset["early_ref_mix"] == SINGLE_SPEAKER_PRESET["early_ref_mix"]
+      and mono_preset["output_gain_db"] == SINGLE_SPEAKER_PRESET["output_gain_db"]
+      and mono_preset["bass_boost_db"] == PRESETS["Cinema"]["bass_boost_db"])
+
 print()
 print("ALL PASS" if ok else "FAILURES PRESENT")
 sys.exit(0 if ok else 1)

@@ -3011,7 +3011,14 @@ class ModAudioApp(ctk.CTk):
         else:
             base = dict(SPEAKERS_PRESET)
         base["mode"] = self._mode
-        base.update(self._slider_vals)
+        if self._mode == "surround_mono":
+            # Preserve the dedicated one-speaker room/EQ/output staging; named
+            # presets still drive the four controls exposed in this tab.
+            for _, key, *_ in SLIDERS:
+                if key in self._slider_vals:
+                    base[key] = self._slider_vals[key]
+        else:
+            base.update(self._slider_vals)
         return base
 
     def _build_ms_preset(self) -> dict:
