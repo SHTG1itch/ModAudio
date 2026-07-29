@@ -2100,9 +2100,10 @@ class ModAudioApp(ctk.CTk):
             try:
                 st = _vdev.get_status()
             except Exception as exc:
+                message = str(exc)
                 def _err():
                     self._ms_vdev_status_lbl.configure(
-                        text=f"Status check failed: {exc}", text_color=C["danger"])
+                        text=f"Status check failed: {message}", text_color=C["danger"])
                 self.after(0, _err)
                 return
 
@@ -2924,9 +2925,10 @@ class ModAudioApp(ctk.CTk):
                 self.after(0, _apply)
 
             except Exception as exc:
+                message = str(exc)
                 def _err():
                     self._ms_lbl_calib_status.configure(
-                        text=f"Calibration failed: {exc}",
+                        text=f"Calibration failed: {message}",
                         text_color=C["danger"],
                     )
                     self._ms_btn_calibrate.configure(
