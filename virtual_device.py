@@ -160,7 +160,9 @@ def download_driver(progress_cb=None) -> str | None:
     if release is None:
         return None
 
-    zip_path = os.path.join(DRIVER_CACHE_DIR, release["zip_name"])
+    zip_name = os.path.basename(release["zip_name"].replace("\\", "/"))
+    tag_name = os.path.basename(release["tag_name"].replace("\\", "/")) or "release"
+    zip_path = os.path.join(DRIVER_CACHE_DIR, zip_name)
 
     # Download (skip if already cached)
     if not os.path.exists(zip_path):
@@ -194,9 +196,13 @@ def download_driver(progress_cb=None) -> str | None:
 
     # Extract
     try:
-        extract_dir = os.path.join(DRIVER_CACHE_DIR, release["tag_name"])
+        extract_dir = os.path.join(DRIVER_CACHE_DIR, tag_name)
         os.makedirs(extract_dir, exist_ok=True)
         with zipfile.ZipFile(zip_path, "r") as zf:
+            root = os.path.abspath(extract_dir)
+            if any(os.path.commonpath([root, os.path.abspath(os.path.join(root, item.filename))]) != root
+                   for item in zf.infolist()):
+                raise ValueError("Driver archive contains an unsafe path")
             zf.extractall(extract_dir)
 
         # Find .inf file
@@ -550,15 +556,18 @@ def _set_default_via_powershell(device_name: str) -> tuple[bool, str]:
     """
     try:
         ps_cmd = (
-            f"$dev = Get-AudioDevice -Playback | "
-            f"Where-Object {{$_.Name -like '*{device_name}*'}} | "
-            f"Select-Object -First 1; "
-            f"if ($dev) {{ $dev | Set-AudioDevice | Out-Null; exit 0 }} else {{ exit 1 }}"
+            "$pattern = '*' + [WildcardPattern]::Escape($env:MODAUDIO_TARGET_DEVICE) + '*'; "
+            "$dev = Get-AudioDevice -Playback | "
+            "Where-Object {$_.Name -like $pattern} | "
+            "Select-Object -First 1; "
+            "if ($dev) { $dev | Set-AudioDevice | Out-Null; exit 0 } else { exit 1 }"
         )
+        env = os.environ.copy()
+        env["MODAUDIO_TARGET_DEVICE"] = device_name
         result = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive",
              "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=15, env=env,
         )
         if result.returncode == 0:
             return True, f"Windows default output → '{device_name}' (via PowerShell)"
