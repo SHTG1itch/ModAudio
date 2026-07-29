@@ -51,6 +51,7 @@ import sounddevice as sd
 
 from dsp.multi_speaker import MultiSpeakerChain
 from config import SOUND_SPEED_MS
+from audio_io import _write_output
 
 # ---------------------------------------------------------------------------
 # Optional WASAPI loopback backend (pyaudiowpatch)
@@ -1012,10 +1013,7 @@ class MultiDeviceStream:
         if status:
             self.xruns += 1
         block = self._front_ring.read_out(frames)
-        out_ch = min(outdata.shape[1], 2)
-        outdata[:, :out_ch] = block[:, :out_ch]
-        if outdata.shape[1] > out_ch:
-            outdata[:, out_ch:] = 0.0
+        _write_output(outdata, block)
 
     def _rear_out_cb(self, outdata: np.ndarray, frames: int,
                      time_info, status) -> None:
@@ -1023,10 +1021,7 @@ class MultiDeviceStream:
         if status:
             self.xruns += 1
         block = self._rear_ring.read_out(frames)
-        out_ch = min(outdata.shape[1], 2)
-        outdata[:, :out_ch] = block[:, :out_ch]
-        if outdata.shape[1] > out_ch:
-            outdata[:, out_ch:] = 0.0
+        _write_output(outdata, block)
 
     # ------------------------------------------------------------------ #
     # Start / Stop
@@ -1632,10 +1627,7 @@ class MultiSpeakerStreamN:
                     if status:
                         self.xruns += 1
                     data = r.read_out(frames)
-                    out_ch = min(outdata.shape[1], 2)
-                    outdata[:, :out_ch] = data[:, :out_ch]
-                    if outdata.shape[1] > out_ch:
-                        outdata[:, out_ch:] = 0.0
+                    _write_output(outdata, data)
                 return _cb
 
             def _make_finished_cb(idx):

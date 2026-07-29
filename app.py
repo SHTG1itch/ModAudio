@@ -24,7 +24,7 @@ import json
 
 from config      import (HEADPHONES_PRESET, SPEAKERS_PRESET,
                          SINGLE_SPEAKER_PRESET, SAMPLE_RATE, BLOCK_SIZE)
-from audio_io    import find_default_devices
+from audio_io    import find_default_devices, _write_output
 from dsp         import TheaterChain, ParametricEQ
 from dsp.speaker_profiles import detect_speaker_profile
 from audio_multi import MultiDeviceStream, MultiSpeakerStreamN, is_bluetooth_device
@@ -3081,8 +3081,7 @@ class ModAudioApp(ctk.CTk):
             in_ch = 2
         try:
             out_info = sd.query_devices(out_dev, "output")
-            out_ch   = min(out_info["max_output_channels"], 8)
-            out_ch   = max(out_ch, 2)
+            out_ch   = min(out_info["max_output_channels"], 2)
         except Exception:
             out_ch = 2
 
@@ -3157,10 +3156,7 @@ class ModAudioApp(ctk.CTk):
             if status:
                 self._xruns += 1
             block = _ring.read_out(frames)
-            out_ch_use = min(outdata.shape[1], 2)
-            outdata[:, :out_ch_use] = block[:, :out_ch_use]
-            if outdata.shape[1] > out_ch_use:
-                outdata[:, out_ch_use:] = 0.0
+            _write_output(outdata, block)
 
         try:
             self._dual_in_stream = sd.InputStream(
@@ -3469,10 +3465,7 @@ class ModAudioApp(ctk.CTk):
             self._raw_out = np.sqrt(np.array([sq2[:, 0].mean(), sq2[:, 1].mean()],
                                              dtype=np.float32))
 
-            out_ch = min(outdata.shape[1], 2)
-            outdata[:, :out_ch] = result[:, :out_ch]
-            if outdata.shape[1] > out_ch:
-                outdata[:, out_ch:] = 0.0
+            _write_output(outdata, result)
 
             self._blk_count += 1
 

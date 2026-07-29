@@ -308,6 +308,19 @@ d48 = _fdn_delays_for_fs(48000)
 check("FDN delays scale to 44.1 kHz",
       np.all(np.abs(d44 / 44100 - d48 / 48000) < 0.001))
 
+# ---- 14. Device output copy/downmix -------------------------------------------
+from audio_io import _write_output
+
+stereo = np.array([[1.0, -0.5], [0.25, 0.75]], dtype=np.float32)
+mono_out = np.empty((2, 1), dtype=np.float32)
+multi_out = np.ones((2, 4), dtype=np.float32)
+_write_output(mono_out, stereo)
+_write_output(multi_out, stereo)
+check("Mono devices receive a proper stereo downmix",
+      np.allclose(mono_out[:, 0], stereo.mean(axis=1)))
+check("Multichannel devices receive stereo only",
+      np.allclose(multi_out[:, :2], stereo) and np.all(multi_out[:, 2:] == 0))
+
 print()
 print("ALL PASS" if ok else "FAILURES PRESENT")
 sys.exit(0 if ok else 1)

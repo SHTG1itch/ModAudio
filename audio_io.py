@@ -28,6 +28,16 @@ import sounddevice as sd
 from config import SAMPLE_RATE, BLOCK_SIZE, CHANNELS
 
 
+def _write_output(outdata: np.ndarray, result: np.ndarray) -> None:
+    """Copy stereo DSP output to a mono, stereo, or multichannel device buffer."""
+    if outdata.shape[1] == 1:
+        outdata[:, 0] = result.mean(axis=1)
+        return
+    outdata[:, :2] = result[:, :2]
+    if outdata.shape[1] > 2:
+        outdata[:, 2:] = 0.0
+
+
 # -- Device discovery ----------------------------------------------------------
 
 def list_devices() -> None:
@@ -194,11 +204,7 @@ class AudioStream:
 
                 result = self._processor(block)
 
-                # Write output
-                out_ch = min(outdata.shape[1], 2)
-                outdata[:, :out_ch] = result[:, :out_ch]
-                if outdata.shape[1] > out_ch:
-                    outdata[:, out_ch:] = 0.0
+                _write_output(outdata, result)
 
                 self._blocks_processed += 1
             except Exception as exc:
@@ -220,8 +226,7 @@ class AudioStream:
 
         try:
             out_info = sd.query_devices(out_dev, "output")
-            out_ch   = min(out_info["max_output_channels"], 8)
-            out_ch   = max(out_ch, 2)
+            out_ch   = min(out_info["max_output_channels"], 2)
         except Exception:
             out_ch = 2
 
