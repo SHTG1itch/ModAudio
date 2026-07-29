@@ -191,6 +191,7 @@ class ModAudioApp(ctk.CTk):
         self._running    = False
         self._stream     = None
         self._chain      = None
+        self._chain_transition = None
         self._rb_timer   = None        # debounce rebuild timer
         self._xruns      = 0
         self._blk_count  = 0
@@ -3038,6 +3039,9 @@ class ModAudioApp(ctk.CTk):
                 custom_eq=self._theater_eq,
             )
             new_chain.set_user_trim(self._master_gain)
+            old_chain = self._chain
+            if self._running and old_chain is not None:
+                self._chain_transition = (new_chain, old_chain, 3)
             self._chain = new_chain   # Python assignment is atomic under GIL
         except Exception as e:
             print(f"[rebuild] {e}")
@@ -3065,6 +3069,7 @@ class ModAudioApp(ctk.CTk):
             self._stop_multi()
 
         preset = self._build_preset()
+        self._chain_transition = None
         self._chain  = TheaterChain(
             fs=SAMPLE_RATE, preset=preset, custom_eq=self._theater_eq)
         self._chain.set_user_trim(self._master_gain)
@@ -3145,7 +3150,7 @@ class ModAudioApp(ctk.CTk):
                 sq = block * block
                 self._raw_in = np.sqrt(
                     np.array([sq[:, 0].mean(), sq[:, 1].mean()], dtype=np.float32))
-                result = chain.process(block)   # user volume is applied inside the chain (pre-limiter)
+                result = self._process_theater(block)
                 sq2 = result * result
                 self._raw_out = np.sqrt(
                     np.array([sq2[:, 0].mean(), sq2[:, 1].mean()], dtype=np.float32))
@@ -3217,6 +3222,7 @@ class ModAudioApp(ctk.CTk):
                     pass
         self._dual_in_stream = self._dual_out_stream = None
         self._dual_queue = None
+        self._chain_transition = None
         self._set_running_ui(False)
         # Decay meters to silence
         self._raw_in[:] = 0
@@ -3439,6 +3445,22 @@ class ModAudioApp(ctk.CTk):
     # Audio callback (runs in sounddevice thread)
     # =======================================================================
 
+    def _process_theater(self, block):
+        """Process one block, crossfading any live Theater chain replacement."""
+        transition = self._chain_transition
+        if transition is None:
+            return self._chain.process(block)
+        new, old, blocks_left = transition
+        result = new.process(block)
+        previous = old.process(block)
+        ramp = np.linspace(blocks_left / 3, (blocks_left - 1) / 3,
+                           len(block), dtype=np.float32)[:, None]
+        result = previous * ramp + result * (1.0 - ramp)
+        if self._chain_transition is transition:
+            self._chain_transition = ((new, old, blocks_left - 1)
+                                      if blocks_left > 1 else None)
+        return result
+
     def _audio_cb(self, indata, outdata, frames, time_info, status):
         if status:
             self._xruns += 1
@@ -3460,7 +3482,7 @@ class ModAudioApp(ctk.CTk):
             self._raw_in = np.sqrt(np.array([sq[:, 0].mean(), sq[:, 1].mean()],
                                             dtype=np.float32))
 
-            result = chain.process(block)   # user volume is applied inside the chain (pre-limiter)
+            result = self._process_theater(block)
 
             # Measure output RMS
             sq2 = result * result

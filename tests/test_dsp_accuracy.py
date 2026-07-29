@@ -344,6 +344,26 @@ bad_pi = {"input_device": 0, "sample_rate": "bad", "speakers": [
 check("Pi config rejects invalid DSP parameters",
       rejects(lambda: validate_config(bad_pi)))
 
+# ---- 16. Single-output chain swaps --------------------------------------------
+from app import ModAudioApp
+
+class ConstantChain:
+    def __init__(self, value): self.value = value
+    def process(self, block): return np.full_like(block, self.value)
+
+class TheaterState:
+    pass
+
+state = TheaterState()
+old_chain, new_chain = ConstantChain(1.0), ConstantChain(-1.0)
+state._chain = new_chain
+state._chain_transition = (new_chain, old_chain, 3)
+fade = [ModAudioApp._process_theater(state, np.zeros((512, 2), np.float32))
+        for _ in range(3)]
+check("Single-output chain swaps crossfade without a jump",
+      fade[0][0, 0] == 1.0 and fade[-1][-1, 0] == -1.0
+      and state._chain_transition is None)
+
 print()
 print("ALL PASS" if ok else "FAILURES PRESENT")
 sys.exit(0 if ok else 1)
